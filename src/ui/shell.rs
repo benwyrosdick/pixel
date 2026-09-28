@@ -1292,7 +1292,7 @@ impl Shell {
         self.canvas.queue_draw();
     }
 
-    fn begin_drag(&self, x: f64, y: f64, button: u32) {
+    fn begin_drag(self: &Rc<Self>, x: f64, y: f64, button: u32) {
         let mut model = self.model.borrow_mut();
         let Some(session) = model.session.as_mut() else {
             return;
@@ -1313,12 +1313,16 @@ impl Shell {
         if button != gdk::BUTTON_PRIMARY {
             return;
         }
+        let mut selected = false;
         let drag = match session.tool {
-            Tool::Move => Drag {
-                kind: move_drag(session, x, y),
-                origin_x: x,
-                origin_y: y,
-            },
+            Tool::Move => {
+                selected = select_under_pointer(session, x, y);
+                Drag {
+                    kind: move_drag(session, x, y),
+                    origin_x: x,
+                    origin_y: y,
+                }
+            }
             Tool::Crop => {
                 let (ax, ay) = widget_to_doc(session, x, y);
                 Drag {
@@ -1330,6 +1334,9 @@ impl Shell {
         };
         drop(model);
         *self.drag.borrow_mut() = Some(drag);
+        if selected {
+            self.refresh();
+        }
     }
 
     fn update_drag(self: &Rc<Self>, x: f64, y: f64, shift: bool) {
@@ -1676,6 +1683,21 @@ fn rotation_degrees(
     }
 }
 
+/// Make the layer under the pointer active, unless the pointer is on one of
+/// the active layer's handles. Returns whether the active layer changed.
+fn select_under_pointer(session: &mut super::model::Session, x: f64, y: f64) -> bool {
+    if hit_at(session, x, y).is_some() {
+        return false;
+    }
+    let (dx, dy) = widget_to_doc(session, x, y);
+    match session.editor.document().layer_at(dx, dy) {
+        Some(index) if index != session.editor.document().active_index() => {
+            session.editor.set_active(index).is_ok()
+        }
+        _ => false,
+    }
+}
+
 fn move_drag(session: &super::model::Session, x: f64, y: f64) -> DragKind {
     let index = session.editor.document().active_index();
     let bounds = active_bounds(session);
@@ -1718,6 +1740,11 @@ fn pointer_inside_layer(session: &super::model::Session, x: f64, y: f64) -> bool
     x >= left.min(right) && x <= left.max(right) && y >= top.min(bottom) && y <= top.max(bottom)
 }
 
+fn pointer_on_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
+    let (dx, dy) = widget_to_doc(session, x, y);
+    session.editor.document().layer_at(dx, dy).is_some()
+}
+
 fn hit_at(session: &super::model::Session, x: f64, y: f64) -> Option<Handle> {
     let bounds = active_bounds(session);
     let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
@@ -1738,7 +1765,12 @@ fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'sta
             Some(Handle::East | Handle::West) => "ew-resize",
             Some(Handle::NorthWest | Handle::SouthEast) => "nwse-resize",
             Some(Handle::NorthEast | Handle::SouthWest) => "nesw-resize",
-            None if pointer_inside_layer(session, x, y) || session.space_down => "grab",
+            None if pointer_inside_layer(session, x, y)
+                || pointer_on_layer(session, x, y)
+                || session.space_down =>
+            {
+                "grab"
+            }
             None => "default",
         },
     };

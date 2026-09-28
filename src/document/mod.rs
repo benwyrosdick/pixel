@@ -203,6 +203,27 @@ impl Document {
         &self.layers[self.active]
     }
 
+    /// The topmost visible layer with a non-transparent pixel at a document
+    /// point. Pixels outside the canvas are not drawn, so they never hit.
+    pub fn layer_at(&self, x: f64, y: f64) -> Option<usize> {
+        if !(x >= 0.0 && y >= 0.0 && x < self.width as f64 && y < self.height as f64) {
+            return None;
+        }
+        let (px, py) = (x.floor() as i64, y.floor() as i64);
+        self.layers.iter().rposition(|layer| {
+            if !layer.visible || layer.opacity <= 0.0 {
+                return false;
+            }
+            let lx = px - layer.x as i64;
+            let ly = py - layer.y as i64;
+            lx >= 0
+                && ly >= 0
+                && lx < layer.width() as i64
+                && ly < layer.height() as i64
+                && layer.pixels.get_pixel(lx as u32, ly as u32)[3] > 0
+        })
+    }
+
     fn layer_mut(&mut self, index: usize) -> Result<&mut Layer, Error> {
         self.layers.get_mut(index).ok_or(Error::BadLayer)
     }
@@ -835,6 +856,46 @@ mod tests {
         assert_eq!(doc.layers[0].pixels.get_pixel(1, 1), &rgba(255, 0, 0, 255));
         assert!(editor.redo());
         assert_eq!(editor.document().width, 2);
+    }
+
+    #[test]
+    fn layer_at_picks_the_topmost_visible_opaque_pixel() {
+        let mut editor = doc_with(4, 4, (1, 1), rgba(255, 0, 0, 255));
+        editor.apply(Command::AddLayer).unwrap();
+        editor.doc.layers[1]
+            .pixels
+            .put_pixel(1, 1, rgba(0, 255, 0, 255));
+        editor.doc.layers[1]
+            .pixels
+            .put_pixel(2, 2, rgba(0, 255, 0, 255));
+        let doc = editor.document();
+        assert_eq!(doc.layer_at(1.5, 1.5), Some(1));
+        assert_eq!(doc.layer_at(2.0, 2.0), Some(1));
+        assert_eq!(doc.layer_at(0.0, 0.0), None);
+        assert_eq!(doc.layer_at(-0.5, 1.0), None);
+
+        editor
+            .apply(Command::SetVisibility {
+                index: 1,
+                visible: false,
+            })
+            .unwrap();
+        let doc = editor.document();
+        assert_eq!(doc.layer_at(1.5, 1.5), Some(0));
+        assert_eq!(doc.layer_at(2.0, 2.0), None);
+    }
+
+    #[test]
+    fn layer_at_follows_the_layer_offset_and_ignores_pixels_off_the_canvas() {
+        let mut editor = doc_with(4, 4, (0, 0), rgba(255, 0, 0, 255));
+        editor.doc.layers[0].x = 2;
+        editor.doc.layers[0].y = 1;
+        assert_eq!(editor.document().layer_at(2.0, 1.0), Some(0));
+        assert_eq!(editor.document().layer_at(0.0, 0.0), None);
+
+        editor.doc.layers[0].x = -1;
+        editor.doc.layers[0].y = 0;
+        assert_eq!(editor.document().layer_at(-0.5, 0.0), None);
     }
 
     #[test]
