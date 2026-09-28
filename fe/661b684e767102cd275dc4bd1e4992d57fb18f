@@ -1,0 +1,52 @@
+.gitignore
+  h_4d9554034adb05 1-3
+Cargo.lock
+  h_4d9554034adb05 1-1539
+Cargo.toml
+  h_4d9554034adb05 1-39
+README.md
+  h_4d9554034adb05 1-45
+assets/pixel.desktop
+  h_4d9554034adb05 1-10
+assets/pixel.svg
+  h_4d9554034adb05 1-5
+assets/pixel.xml
+  h_4d9554034adb05 1-7
+src/document/composite.rs
+  h_4d9554034adb05 1-84
+src/document/io.rs
+  h_4d9554034adb05 1-395
+src/document/mod.rs
+  h_4d9554034adb05 1-1107
+src/document/ops.rs
+  h_4d9554034adb05 1-246
+src/lib.rs
+  h_4d9554034adb05 1-6
+src/main.rs
+  h_4d9554034adb05 1-19
+src/ui/canvas.rs
+  h_4d9554034adb05 1-260
+src/ui/dialogs.rs
+  h_4d9554034adb05 1-405
+src/ui/layers.rs
+  h_4d9554034adb05 1-271
+src/ui/mod.rs
+  h_4d9554034adb05 1-12
+src/ui/model.rs
+  h_4d9554034adb05 1-131
+src/ui/shell.rs
+  h_4d9554034adb05 1-1573
+src/ui/theme.rs
+  h_4d9554034adb05 1-148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fe661b684e767102cd275dc4bd1e4992d57fb18f",
+  "prompts": {},
+  "humans": {
+    "h_4d9554034adb05": {
+      "author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
