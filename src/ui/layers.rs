@@ -49,8 +49,13 @@ impl LayersPanel {
         root.append(&title);
 
         let list = gtk::ListBox::new();
-        // Ctrl-click and Shift-click select several rows.
-        list.set_selection_mode(gtk::SelectionMode::Multiple);
+        // Rows handle their own clicks, so selecting here works like it does
+        // on the canvas: a click selects one layer, and Shift-click adds or
+        // removes one. GTK's multiple selection has rules of its own.
+        list.set_selection_mode(gtk::SelectionMode::None);
+        // Otherwise a plain click also activates the row, which would select
+        // it alone right after a Shift-click added it.
+        list.set_activate_on_single_click(false);
         list.set_vexpand(true);
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -145,25 +150,17 @@ impl LayersPanel {
     }
 
     pub fn connect(&self, shell: &Rc<Shell>) {
+        // Enter or Space on a focused row selects that layer alone.
         let shell_select = shell.clone();
-        let updating = self.updating.clone();
         let rows = self.rows.clone();
-        self.list.connect_selected_rows_changed(move |list| {
-            if updating.get() {
-                return;
+        self.list.connect_row_activated(move |_, row| {
+            let index = usize::try_from(row.index())
+                .ok()
+                .and_then(|row| rows.borrow().get(row).copied());
+            if let Some(index) = index {
+                let shell = shell_select.clone();
+                glib::idle_add_local_once(move || shell.click_layer(index, false));
             }
-            let rows = rows.borrow();
-            let mut indices: Vec<usize> = list
-                .selected_rows()
-                .iter()
-                .filter_map(|row| usize::try_from(row.index()).ok())
-                .filter_map(|row| rows.get(row).copied())
-                .collect();
-            indices.sort_unstable();
-            // Applying the selection rebuilds these rows, so wait until the
-            // list has finished its own update.
-            let shell = shell_select.clone();
-            glib::idle_add_local_once(move || shell.set_selection(indices));
         });
 
         let dragging = self.dragging.clone();
@@ -250,14 +247,15 @@ impl LayersPanel {
                 row.grab_focus();
             }
         }
-        self.list.unselect_all();
-        for index in doc.selected_indices() {
-            let Some(visual) = rows.iter().position(|&row| row == index) else {
+        for (visual, &index) in rows.iter().enumerate() {
+            let Some(row) = self.list.row_at_index(visual as i32) else {
                 continue;
             };
-            if let Some(row) = self.list.row_at_index(visual as i32) {
-                self.list.select_row(Some(&row));
+            let selected = doc.is_selected(index);
+            if selected {
+                row.add_css_class("pixel-selected");
             }
+            row.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
         }
         *self.rows.borrow_mut() = rows;
         let active = doc.active_layer();
@@ -681,17 +679,30 @@ fn layer_row(
 
     let row_for_hit = row.clone();
     let name_for_hit = name_box.clone();
-    let rename_click = gtk::GestureClick::new();
-    rename_click.set_button(gdk::BUTTON_PRIMARY);
-    rename_click.connect_pressed(move |_, n_press, x, _| {
-        let on_name = name_for_hit
-            .compute_bounds(&row_for_hit)
-            .is_some_and(|bounds| x >= f64::from(bounds.x()));
-        if n_press == 2 && on_name {
-            begin_edit();
+    // A click selects the layer, and Shift or Ctrl adds or removes it. A
+    // double-click on the name renames it. The row's own buttons take their
+    // clicks first, so the eye and lock leave the selection alone.
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_PRIMARY);
+    let shell_click = shell.clone();
+    click.connect_pressed(move |gesture, n_press, x, _| {
+        if n_press == 2 {
+            let on_name = name_for_hit
+                .compute_bounds(&row_for_hit)
+                .is_some_and(|bounds| x >= f64::from(bounds.x()));
+            if on_name {
+                begin_edit();
+            }
+            return;
         }
+        let state = gesture.current_event_state();
+        let extend =
+            state.intersects(gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK);
+        // Selecting rebuilds the rows, so finish with this press first.
+        let shell = shell_click.clone();
+        glib::idle_add_local_once(move || shell.click_layer(index, extend));
     });
-    row.add_controller(rename_click);
+    row.add_controller(click);
 
     // Right-click opens the layer's menu, with its adjustments.
     let menu_click = gtk::GestureClick::new();

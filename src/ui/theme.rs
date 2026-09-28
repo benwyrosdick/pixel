@@ -92,7 +92,7 @@ impl ThemeColors {
               background-color: {accent};
               color: {darker};
             }}
-            row.pixel-layer:selected {{
+            row.pixel-layer.pixel-selected {{
               background-color: {selection};
             }}
             paned.pixel-split > separator {{

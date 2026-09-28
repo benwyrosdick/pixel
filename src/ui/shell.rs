@@ -758,6 +758,24 @@ impl Shell {
     }
 
     /// `indices` run bottom to top, like [`Document::selected_indices`].
+    /// A click on a layer's row: select it alone, or with `extend`, add it to
+    /// the selection or take it out, as Shift-clicking on the canvas does.
+    pub fn click_layer(self: &Rc<Self>, index: usize, extend: bool) {
+        if !extend {
+            self.set_selection(vec![index]);
+            return;
+        }
+        let changed = self
+            .model
+            .borrow_mut()
+            .session
+            .as_mut()
+            .is_some_and(|session| session.editor.toggle_selected(index).is_ok());
+        if changed {
+            self.refresh();
+        }
+    }
+
     pub fn set_selection(self: &Rc<Self>, indices: Vec<usize>) {
         let changed = {
             let mut model = self.model.borrow_mut();
