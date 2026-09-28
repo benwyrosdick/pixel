@@ -1,0 +1,19 @@
+src/ui/shell.rs
+  s_e5d054807dbd83::t_e463cbc57ec8bf 500-506
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cb3a07ad8944378040a950fdf8a05e896cc08e8b",
+  "prompts": {},
+  "sessions": {
+    "s_e5d054807dbd83": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "37717b74-9e79-4f0a-8b2b-5900e74441c5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
