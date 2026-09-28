@@ -497,7 +497,13 @@ impl Shell {
         }
         self.window.add_controller(shortcuts);
 
-        let drop = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+        // File browsers on Wayland can offer a file drag only as a move. Pixel
+        // reads the file and never deletes it, so a move drop is as safe as a
+        // copy, and GTK still picks copy when the source offers both.
+        let drop = gtk::DropTarget::new(
+            glib::Type::INVALID,
+            gdk::DragAction::COPY | gdk::DragAction::MOVE,
+        );
         drop.set_types(&[gdk::FileList::static_type(), gdk::Texture::static_type()]);
         let shell = self.clone();
         drop.connect_drop(move |_, value, _, _| {
