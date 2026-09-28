@@ -13,10 +13,8 @@ pub fn reorder(doc: &mut Document, from: usize, to: usize) -> Result<(), Error> 
     if from == to {
         return Ok(());
     }
-    let active_id = doc.active.map(|index| doc.layers[index].id);
     let layer = doc.layers.remove(from);
     doc.layers.insert(to, layer);
-    doc.active = active_id.and_then(|id| doc.layers.iter().position(|layer| layer.id == id));
     Ok(())
 }
 

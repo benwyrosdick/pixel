@@ -110,14 +110,28 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
             pixels,
         });
     }
-    let active = manifest.active.map(|index| index.min(layers.len() - 1));
+    let last = layers.len() - 1;
+    let selected: Vec<usize> = if manifest.selected.is_empty() {
+        manifest
+            .active
+            .map(|index| index.min(last))
+            .into_iter()
+            .collect()
+    } else {
+        manifest
+            .selected
+            .iter()
+            .copied()
+            .filter(|&index| index <= last)
+            .collect()
+    };
     Document::from_parts(
         manifest.width,
         manifest.height,
         manifest.ppi,
         manifest.background.into(),
         layers,
-        active,
+        &selected,
         next_id,
     )
 }
@@ -139,8 +153,11 @@ struct Manifest {
     height: u32,
     ppi: f32,
     background: BackgroundSer,
-    /// `null` when no layer was selected.
+    /// The selected layer when exactly one was, for older versions of Pixel.
     active: Option<usize>,
+    /// Missing from projects saved before multiple layers could be selected.
+    #[serde(default)]
+    selected: Vec<usize>,
     layers: Vec<LayerSer>,
 }
 
@@ -187,6 +204,7 @@ impl Manifest {
                 Background::Solid(rgba) => BackgroundSer::Solid { rgba },
             },
             active: doc.active_index(),
+            selected: doc.selected_indices(),
             layers: doc
                 .layers()
                 .iter()
@@ -407,6 +425,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.active, Some(0));
+    }
+
+    #[test]
+    fn project_roundtrip_keeps_several_selected_layers() {
+        let mut editor = Editor::new(sample_doc());
+        editor.apply(Command::AddLayer).unwrap();
+        editor.apply(Command::AddLayer).unwrap();
+        editor.set_selection(&[0, 2]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        assert_eq!(open_project(&path).unwrap().selected_indices(), vec![0, 2]);
     }
 
     #[test]

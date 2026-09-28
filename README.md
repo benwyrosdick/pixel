@@ -35,7 +35,8 @@ The window reads `~/.local/state/omarchy/current/theme/colors.toml` and follows 
 | Export | Ctrl+Shift+E |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Fit / actual size | Ctrl+0 / Ctrl+1 |
-| Move / crop | V / C |
-| Nudge the active layer | Arrow keys, Shift for 10 px |
+| Select / move / crop | V / M / C |
+| Add to or remove from the selection | Shift-click, or Shift-drag a box |
+| Nudge the selected layers | Arrow keys, Shift for 10 px |
 
 Projects are zip files with a `.pixel` extension. Export writes PNG, JPEG, or lossless WebP and does not change the open document. JPEG is flattened onto the canvas background, or onto white when the background is transparent.

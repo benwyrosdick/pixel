@@ -1,6 +1,6 @@
 //! Pan, zoom, and draw the flattened document. Input is reported upward.
 
-use super::model::{active_bounds, doc_to_widget, rendered, Model, Session, Tool};
+use super::model::{active_bounds, doc_to_widget, layer_bounds, rendered, Model, Session, Tool};
 use gtk::gdk;
 use gtk::glib;
 use gtk::graphene;
@@ -198,9 +198,8 @@ mod imp {
                 snapshot.append_color(&color, &graphene::Rect::new(x + w - border, y, border, h));
             }
             snapshot.restore();
-            let editable = doc.active_layer().is_some_and(|layer| !layer.locked);
-            if session.tool == Tool::Move && editable {
-                draw_handles(snapshot, session, model.accent);
+            if session.tool != Tool::Crop {
+                draw_selection(snapshot, session, model.accent);
             }
         }
 
@@ -256,6 +255,43 @@ impl Canvas {
 
     pub fn set_handler(&self, handler: Rc<dyn Fn(CanvasInput)>) {
         *self.imp().handler.borrow_mut() = Some(handler);
+    }
+}
+
+/// Outline every selected layer, and the select tool's drag box. The move tool
+/// draws handles instead when one unlocked layer is selected.
+fn draw_selection(snapshot: &gtk::Snapshot, session: &Session, accent: (f32, f32, f32)) {
+    let doc = session.editor.document();
+    let (r, g, b) = accent;
+    let stroke = gdk::RGBA::new(r, g, b, 1.0);
+    let editable = doc.active_layer().is_some_and(|layer| !layer.locked);
+    if session.tool == Tool::Move && editable {
+        draw_handles(snapshot, session, accent);
+    } else {
+        for index in doc.selected_indices() {
+            let bounds = layer_bounds(session, index);
+            let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
+            let (right, bottom) = doc_to_widget(
+                session,
+                bounds.x as f64 + bounds.width as f64,
+                bounds.y as f64 + bounds.height as f64,
+            );
+            stroke_rect(snapshot, left, top, right, bottom, &stroke);
+        }
+    }
+    if let Some((ax, ay, bx, by)) = session.marquee {
+        let (left, top) = doc_to_widget(session, ax.min(bx), ay.min(by));
+        let (right, bottom) = doc_to_widget(session, ax.max(bx), ay.max(by));
+        snapshot.append_color(
+            &gdk::RGBA::new(r, g, b, 0.15),
+            &graphene::Rect::new(
+                left as f32,
+                top as f32,
+                (right - left) as f32,
+                (bottom - top) as f32,
+            ),
+        );
+        stroke_rect(snapshot, left, top, right, bottom, &stroke);
     }
 }
 

@@ -38,7 +38,8 @@ impl LayersPanel {
         root.append(&title);
 
         let list = gtk::ListBox::new();
-        list.set_selection_mode(gtk::SelectionMode::Single);
+        // Ctrl-click and Shift-click select several rows.
+        list.set_selection_mode(gtk::SelectionMode::Multiple);
         list.set_vexpand(true);
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -109,22 +110,23 @@ impl LayersPanel {
     pub fn connect(&self, shell: &Rc<Shell>) {
         let shell_select = shell.clone();
         let updating = self.updating.clone();
-        self.list.connect_row_selected(move |_, row| {
+        self.list.connect_selected_rows_changed(move |list| {
             if updating.get() {
                 return;
             }
-            let Some(row) = row else {
-                return;
-            };
-            let visual = row.index();
-            if visual < 0 {
-                return;
-            }
             let len = shell_select.layer_count();
-            if visual as usize >= len {
-                return;
-            }
-            shell_select.set_active(len - 1 - visual as usize);
+            // Rows run top to bottom, layers bottom to top.
+            let indices: Vec<usize> = list
+                .selected_rows()
+                .iter()
+                .filter_map(|row| usize::try_from(row.index()).ok())
+                .filter(|&visual| visual < len)
+                .map(|visual| len - 1 - visual)
+                .collect();
+            // Applying the selection rebuilds these rows, so wait until the
+            // list has finished its own update.
+            let shell = shell_select.clone();
+            glib::idle_add_local_once(move || shell.set_selection(indices));
         });
 
         let dragging = self.dragging.clone();
@@ -173,14 +175,12 @@ impl LayersPanel {
         for (index, layer) in doc.layers().iter().enumerate().rev() {
             self.list.append(&layer_row(shell, index, layer));
         }
-        match doc.active_index() {
-            Some(index) => {
-                let visual = (doc.layers().len() - 1 - index) as i32;
-                if let Some(row) = self.list.row_at_index(visual) {
-                    self.list.select_row(Some(&row));
-                }
+        self.list.unselect_all();
+        for index in doc.selected_indices() {
+            let visual = (doc.layers().len() - 1 - index) as i32;
+            if let Some(row) = self.list.row_at_index(visual) {
+                self.list.select_row(Some(&row));
             }
-            None => self.list.unselect_all(),
         }
         let active = doc.active_layer();
         if !self.dragging.get() {
@@ -190,14 +190,12 @@ impl LayersPanel {
         self.opacity
             .set_sensitive(active.is_some_and(|layer| !layer.locked));
         let buttons = self.buttons();
-        for button in [
-            &buttons.duplicate,
-            &buttons.delete,
-            &buttons.up,
-            &buttons.down,
-        ] {
+        for button in [&buttons.duplicate, &buttons.up, &buttons.down] {
             button.set_sensitive(active.is_some());
         }
+        buttons
+            .delete
+            .set_sensitive(!doc.selected_indices().is_empty());
         self.updating.set(false);
     }
 

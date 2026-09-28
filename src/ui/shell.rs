@@ -4,8 +4,8 @@ use super::canvas::{Canvas, CanvasInput};
 use super::dialogs;
 use super::layers::LayersPanel;
 use super::model::{
-    active_bounds, doc_to_widget, document_title, fit_view, jpeg_needs_white, widget_to_doc,
-    CropDraft, Model, Preview, Tool,
+    active_bounds, doc_to_widget, document_title, fit_view, jpeg_needs_white, layer_bounds,
+    widget_to_doc, CropDraft, Model, Preview, Tool,
 };
 use super::theme::{self, ThemeColors};
 use gtk::gdk;
@@ -33,6 +33,7 @@ pub struct Shell {
     status_cursor: gtk::Label,
     pub canvas: Canvas,
     layers: LayersPanel,
+    select_tool: gtk::ToggleButton,
     move_tool: gtk::ToggleButton,
     crop_tool: gtk::ToggleButton,
     undo_btn: gtk::Button,
@@ -59,9 +60,12 @@ enum DragKind {
         pan_y: f64,
     },
     Move {
-        index: usize,
-        x: i32,
-        y: i32,
+        indices: Vec<usize>,
+    },
+    /// A select-tool press. It becomes a drag box once the pointer travels.
+    Select {
+        ax: f64,
+        ay: f64,
     },
     Resize {
         index: usize,
@@ -118,16 +122,19 @@ impl Shell {
         canvas.set_model(model.clone());
         let layers = LayersPanel::new();
 
+        let select_tool = tool_button("Select");
         let move_tool = tool_button("Move");
         let crop_tool = tool_button("Crop");
-        crop_tool.set_group(Some(&move_tool));
-        move_tool.set_active(true);
+        move_tool.set_group(Some(&select_tool));
+        crop_tool.set_group(Some(&select_tool));
+        select_tool.set_active(true);
         let tools = gtk::Box::new(gtk::Orientation::Vertical, 0);
         tools.add_css_class("pixel-panel");
         tools.set_width_request(76);
         tools.set_hexpand(false);
         tools.set_hexpand_set(true);
         tools.set_vexpand(true);
+        tools.append(&select_tool);
         tools.append(&move_tool);
         tools.append(&crop_tool);
 
@@ -238,6 +245,7 @@ impl Shell {
             status_cursor,
             canvas,
             layers,
+            select_tool,
             move_tool,
             crop_tool,
             undo_btn,
@@ -280,11 +288,9 @@ impl Shell {
             }
         });
         let shell = self.clone();
-        buttons.delete.connect_clicked(move |_| {
-            if let Some(index) = shell.active_index() {
-                shell.edit(Command::DeleteLayer { index });
-            }
-        });
+        buttons
+            .delete
+            .connect_clicked(move |_| shell.delete_selected());
         let shell = self.clone();
         buttons.up.connect_clicked(move |_| shell.reorder_active(1));
         let shell = self.clone();
@@ -292,6 +298,12 @@ impl Shell {
             .down
             .connect_clicked(move |_| shell.reorder_active(-1));
 
+        let shell = self.clone();
+        self.select_tool.connect_toggled(move |button| {
+            if button.is_active() {
+                shell.set_tool(Tool::Select);
+            }
+        });
         let shell = self.clone();
         self.move_tool.connect_toggled(move |button| {
             if button.is_active() {
@@ -375,11 +387,7 @@ impl Shell {
                 shell.edit(Command::DuplicateLayer { index });
             }
         });
-        self.add_action("delete-layer", &[], |shell| {
-            if let Some(index) = shell.active_index() {
-                shell.edit(Command::DeleteLayer { index });
-            }
-        });
+        self.add_action("delete-layer", &[], |shell| shell.delete_selected());
         self.add_action("rotate-layer", &[], |shell| shell.rotate_layer());
         self.add_action("flip-layer-h", &[], |shell| {
             if let Some(index) = shell.active_index() {
@@ -401,7 +409,8 @@ impl Shell {
         self.add_action("lower", &[], |shell| shell.reorder_active(-1));
         self.add_action("fit", &["<primary>0"], |shell| shell.zoom_fit());
         self.add_action("actual", &["<primary>1"], |shell| shell.zoom_actual());
-        self.add_action("tool-move", &["v"], |shell| shell.set_tool(Tool::Move));
+        self.add_action("tool-select", &["v"], |shell| shell.set_tool(Tool::Select));
+        self.add_action("tool-move", &["m"], |shell| shell.set_tool(Tool::Move));
         self.add_action("tool-crop", &["c"], |shell| shell.set_tool(Tool::Crop));
 
         let keys = gtk::EventControllerKey::new();
@@ -472,19 +481,33 @@ impl Shell {
         }
     }
 
-    pub fn set_active(self: &Rc<Self>, index: usize) {
+    /// `indices` run bottom to top, like [`Document::selected_indices`].
+    pub fn set_selection(self: &Rc<Self>, indices: Vec<usize>) {
         let changed = {
             let mut model = self.model.borrow_mut();
             let Some(session) = model.session.as_mut() else {
                 return;
             };
-            if session.editor.document().active_index() == Some(index) {
+            if session.editor.document().selected_indices() == indices {
                 return;
             }
-            session.editor.set_active(index).is_ok()
+            session.editor.set_selection(&indices).is_ok()
         };
         if changed {
             self.refresh();
+        }
+    }
+
+    fn delete_selected(self: &Rc<Self>) {
+        let indices = self
+            .model
+            .borrow()
+            .session
+            .as_ref()
+            .map(|session| session.editor.document().selected_indices())
+            .unwrap_or_default();
+        if !indices.is_empty() {
+            self.edit(Command::DeleteLayers { indices });
         }
     }
 
@@ -558,6 +581,8 @@ impl Shell {
             self.status_zoom
                 .set_label(&format!("{:.0}%", session.zoom * 100.0));
             self.status_cursor.set_label(&cursor_text(session.cursor));
+            self.select_tool
+                .set_active(matches!(session.tool, Tool::Select));
             self.move_tool
                 .set_active(matches!(session.tool, Tool::Move));
             self.crop_tool
@@ -569,9 +594,10 @@ impl Shell {
             self.enable("redo", session.editor.can_redo());
             self.enable_document_actions(true);
             let active = doc.active_layer();
-            for name in ["duplicate", "delete-layer", "raise", "lower"] {
+            for name in ["duplicate", "raise", "lower"] {
                 self.enable(name, active.is_some());
             }
+            self.enable("delete-layer", !doc.selected_indices().is_empty());
             let editable = active.is_some_and(|layer| !layer.locked);
             for name in ["rotate-layer", "flip-layer-h", "flip-layer-v"] {
                 self.enable(name, editable);
@@ -632,6 +658,7 @@ impl Shell {
             "lower",
             "fit",
             "actual",
+            "tool-select",
             "tool-move",
             "tool-crop",
             "undo",
@@ -652,9 +679,14 @@ impl Shell {
             return;
         };
         match session.tool {
+            Tool::Select => {
+                self.tool_options.append(&gtk::Label::new(Some(
+                    "Click a layer to select it, or Shift-click to add or remove it. Drag a box around layers to select them, with Shift to add them.",
+                )));
+            }
             Tool::Move => {
                 self.tool_options.append(&gtk::Label::new(Some(
-                    "Drag the layer to move it. Handles resize it, and the round handle rotates it. Shift locks the aspect ratio, and snaps rotation to 45°. Arrow keys nudge 1 px, Shift nudges 10.",
+                    "Drag the selection to move it. With one layer selected, handles resize it and the round handle rotates it. Shift locks the aspect ratio, and snaps rotation to 45°. Arrow keys nudge 1 px, Shift nudges 10.",
                 )));
             }
             Tool::Crop => {
@@ -688,7 +720,7 @@ impl Shell {
                     "grab"
                 } else {
                     match session.tool {
-                        Tool::Move => "default",
+                        Tool::Select | Tool::Move => "default",
                         Tool::Crop => "crosshair",
                     }
                 }
@@ -710,6 +742,7 @@ impl Shell {
                 return;
             }
             session.tool = tool;
+            session.marquee = None;
             if !matches!(tool, Tool::Crop) {
                 session.crop = None;
             }
@@ -1204,19 +1237,16 @@ impl Shell {
     }
 
     fn nudge(self: &Rc<Self>, dx: i32, dy: i32) {
-        let Some((index, x, y)) = self.model.borrow().session.as_ref().and_then(|session| {
-            let doc = session.editor.document();
-            let index = doc.active_index()?;
-            let layer = &doc.layers()[index];
-            (!layer.locked).then_some((index, layer.x, layer.y))
-        }) else {
-            return;
-        };
-        self.edit(Command::MoveLayer {
-            index,
-            x: x + dx,
-            y: y + dy,
-        });
+        let indices = self
+            .model
+            .borrow()
+            .session
+            .as_ref()
+            .map(|session| movable_selection(session.editor.document()))
+            .unwrap_or_default();
+        if !indices.is_empty() {
+            self.edit(Command::MoveLayers { indices, dx, dy });
+        }
     }
 
     fn typing(&self) -> bool {
@@ -1326,6 +1356,14 @@ impl Shell {
         }
         let mut selected = false;
         let drag = match session.tool {
+            Tool::Select => {
+                let (ax, ay) = widget_to_doc(session, x, y);
+                Drag {
+                    kind: DragKind::Select { ax, ay },
+                    origin_x: x,
+                    origin_y: y,
+                }
+            }
             Tool::Move => {
                 selected = select_under_pointer(session, x, y);
                 let Some(kind) = move_drag(session, x, y) else {
@@ -1420,29 +1458,33 @@ impl Shell {
                 drop(model);
                 self.canvas.queue_draw();
             }
-            DragKind::Move {
-                index,
-                x: lx,
-                y: ly,
-            } => {
+            DragKind::Move { indices } => {
                 let (dx, dy) = {
                     let model = self.model.borrow();
                     let Some(session) = model.session.as_ref() else {
                         return;
                     };
-                    let (cx, cy) = widget_to_doc(session, x, y);
-                    let (ox, oy) = widget_to_doc(session, drag.origin_x, drag.origin_y);
-                    ((cx - ox).round() as i32, (cy - oy).round() as i32)
+                    drag_offset(session, (drag.origin_x, drag.origin_y), x, y)
                 };
                 let mut model = self.model.borrow_mut();
                 if let Some(session) = model.session.as_mut() {
-                    session.preview = Some(Preview::Move {
-                        index,
-                        x: lx + dx,
-                        y: ly + dy,
-                    });
+                    session.preview = Some(Preview::Move { indices, dx, dy });
                     session.visual = session.visual.wrapping_add(1);
                 }
+                drop(model);
+                self.canvas.queue_draw();
+            }
+            DragKind::Select { ax, ay } => {
+                let travelled = (x - drag.origin_x).hypot(y - drag.origin_y);
+                let mut model = self.model.borrow_mut();
+                let Some(session) = model.session.as_mut() else {
+                    return;
+                };
+                if session.marquee.is_none() && travelled < CLICK_SLOP {
+                    return;
+                }
+                let (bx, by) = widget_to_doc(session, x, y);
+                session.marquee = Some((ax, ay, bx, by));
                 drop(model);
                 self.canvas.queue_draw();
             }
@@ -1472,28 +1514,24 @@ impl Shell {
             return;
         };
         match drag.kind {
-            DragKind::Move {
-                index,
-                x: lx,
-                y: ly,
-            } => {
+            DragKind::Move { indices } => {
                 let (dx, dy) = {
                     let model = self.model.borrow();
                     let Some(session) = model.session.as_ref() else {
                         return;
                     };
-                    let (cx, cy) = widget_to_doc(session, x, y);
-                    let (ox, oy) = widget_to_doc(session, drag.origin_x, drag.origin_y);
-                    ((cx - ox).round() as i32, (cy - oy).round() as i32)
+                    drag_offset(session, (drag.origin_x, drag.origin_y), x, y)
                 };
                 if let Some(session) = self.model.borrow_mut().session.as_mut() {
                     session.preview = None;
                 }
-                self.edit(Command::MoveLayer {
-                    index,
-                    x: lx + dx,
-                    y: ly + dy,
-                });
+                self.edit(Command::MoveLayers { indices, dx, dy });
+            }
+            DragKind::Select { ax, ay } => {
+                if let Some(session) = self.model.borrow_mut().session.as_mut() {
+                    select_on_release(session, ax, ay, x, y, shift);
+                }
+                self.refresh();
             }
             DragKind::Resize {
                 index,
@@ -1664,6 +1702,7 @@ fn app_menu() -> gio::Menu {
         let menu = gio::Menu::new();
         menu.append(Some("Fit"), Some("win.fit"));
         menu.append(Some("Actual Size"), Some("win.actual"));
+        menu.append(Some("Select Tool"), Some("win.tool-select"));
         menu.append(Some("Move Tool"), Some("win.tool-move"));
         menu.append(Some("Crop Tool"), Some("win.tool-crop"));
         menu
@@ -1701,26 +1740,85 @@ fn rotation_degrees(
     }
 }
 
-/// Make the layer under the pointer active. The active layer's handles and
-/// the rest of its box keep it selected, so a layer with transparent areas can
-/// still be grabbed. A click on nothing deselects. Returns whether the
-/// selection changed.
+/// How far, in screen pixels, a select-tool press can wander and still count
+/// as a click.
+const CLICK_SLOP: f64 = 3.0;
+
+/// Selected layers that a move can shift. Locked ones stay put.
+fn movable_selection(doc: &Document) -> Vec<usize> {
+    doc.selected_indices()
+        .into_iter()
+        .filter(|&index| !doc.layers()[index].locked)
+        .collect()
+}
+
+/// Whole document pixels between a drag's start and `(x, y)`.
+fn drag_offset(session: &super::model::Session, origin: (f64, f64), x: f64, y: f64) -> (i32, i32) {
+    let (cx, cy) = widget_to_doc(session, x, y);
+    let (ox, oy) = widget_to_doc(session, origin.0, origin.1);
+    ((cx - ox).round() as i32, (cy - oy).round() as i32)
+}
+
+/// Finish a select-tool press. A drag box selects the layers it encloses. A
+/// click selects the layer under it, or clears the selection over nothing.
+/// Shift adds to the selection, and a Shift-click on a selected layer removes it.
+fn select_on_release(
+    session: &mut super::model::Session,
+    ax: f64,
+    ay: f64,
+    x: f64,
+    y: f64,
+    shift: bool,
+) {
+    let (bx, by) = widget_to_doc(session, x, y);
+    let doc = session.editor.document();
+    let result = match session.marquee.take() {
+        Some(_) => {
+            let left = ax.min(bx).floor();
+            let top = ay.min(by).floor();
+            let area = PixelRect {
+                x: left as i32,
+                y: top as i32,
+                width: (ax.max(bx).ceil() - left) as u32,
+                height: (ay.max(by).ceil() - top) as u32,
+            };
+            let mut indices = doc.layers_within(area);
+            if shift {
+                indices.extend(doc.selected_indices());
+                indices.sort_unstable();
+                indices.dedup();
+            }
+            session.editor.set_selection(&indices)
+        }
+        None => match doc.layer_at(ax, ay) {
+            Some(index) if shift => session.editor.toggle_selected(index),
+            Some(index) => session.editor.set_active(index),
+            None if shift => Ok(()),
+            None => {
+                session.editor.deselect();
+                Ok(())
+            }
+        },
+    };
+    debug_assert!(result.is_ok(), "picked layers come from the document");
+}
+
+/// Update the selection for a move-tool press. A layer under the pointer is
+/// selected alone unless it is already part of the selection. The handles and
+/// the boxes of selected layers keep the selection, so a layer with
+/// transparent areas can still be grabbed. A press on nothing deselects.
+/// Returns whether the selection changed.
 fn select_under_pointer(session: &mut super::model::Session, x: f64, y: f64) -> bool {
     if hit_at(session, x, y).is_some() {
         return false;
     }
     let (dx, dy) = widget_to_doc(session, x, y);
     let doc = session.editor.document();
-    let active = doc.active_index();
-    let keep = active.filter(|_| {
-        doc.active_layer().is_some_and(|layer| !layer.locked) && pointer_inside_layer(session, x, y)
-    });
-    let target = doc.layer_at(dx, dy).or(keep);
-    if target == active {
-        return false;
-    }
-    match target {
+    match doc.layer_at(dx, dy) {
+        Some(index) if doc.is_selected(index) => false,
         Some(index) => session.editor.set_active(index).is_ok(),
+        None if pointer_in_selection(session, x, y) => false,
+        None if doc.selected_indices().is_empty() => false,
         None => {
             session.editor.deselect();
             true
@@ -1728,11 +1826,14 @@ fn select_under_pointer(session: &mut super::model::Session, x: f64, y: f64) -> 
     }
 }
 
-/// The drag the move tool starts on the active layer, or `None` when nothing
-/// editable is selected.
+/// The drag the move tool starts, or `None` when nothing movable is selected.
+/// Handles only exist when one layer is selected.
 fn move_drag(session: &super::model::Session, x: f64, y: f64) -> Option<DragKind> {
     let doc = session.editor.document();
-    let index = doc.active_index()?;
+    let Some(index) = doc.active_index() else {
+        let indices = movable_selection(doc);
+        return (!indices.is_empty()).then_some(DragKind::Move { indices });
+    };
     let layer = &doc.layers()[index];
     if layer.locked {
         return None;
@@ -1756,18 +1857,28 @@ fn move_drag(session: &super::model::Session, x: f64, y: f64) -> Option<DragKind
             origin: bounds,
         },
         None => DragKind::Move {
-            index,
-            x: layer.x,
-            y: layer.y,
+            indices: vec![index],
         },
     };
     Some(kind)
 }
 
-fn pointer_inside_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
-    let Some(bounds) = active_bounds(session) else {
-        return false;
-    };
+/// Whether the pointer is inside the box of a selected layer that can move.
+fn pointer_in_selection(session: &super::model::Session, x: f64, y: f64) -> bool {
+    movable_selection(session.editor.document())
+        .into_iter()
+        .any(|index| pointer_in_bounds(session, layer_bounds(session, index), x, y))
+}
+
+/// Whether the pointer is inside the box of a selected, locked layer.
+fn pointer_on_locked_selection(session: &super::model::Session, x: f64, y: f64) -> bool {
+    let doc = session.editor.document();
+    doc.selected_indices().into_iter().any(|index| {
+        doc.layers()[index].locked && pointer_in_bounds(session, layer_bounds(session, index), x, y)
+    })
+}
+
+fn pointer_in_bounds(session: &super::model::Session, bounds: PixelRect, x: f64, y: f64) -> bool {
     let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
     let (right, bottom) = doc_to_widget(
         session,
@@ -1799,6 +1910,8 @@ fn hit_at(session: &super::model::Session, x: f64, y: f64) -> Option<Handle> {
 
 fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'static str> {
     let name = match session.tool {
+        Tool::Select if session.space_down => "grab",
+        Tool::Select => "default",
         Tool::Crop => "crosshair",
         Tool::Move => match hit_at(session, x, y) {
             Some(Handle::Rotate) => "crosshair",
@@ -1806,19 +1919,13 @@ fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'sta
             Some(Handle::East | Handle::West) => "ew-resize",
             Some(Handle::NorthWest | Handle::SouthEast) => "nwse-resize",
             Some(Handle::NorthEast | Handle::SouthWest) => "nesw-resize",
-            None if session.space_down || pointer_on_layer(session, x, y) => "grab",
-            None if pointer_inside_layer(session, x, y) => {
-                if session
-                    .editor
-                    .document()
-                    .active_layer()
-                    .is_some_and(|layer| layer.locked)
-                {
-                    "not-allowed"
-                } else {
-                    "grab"
-                }
+            None if session.space_down
+                || pointer_on_layer(session, x, y)
+                || pointer_in_selection(session, x, y) =>
+            {
+                "grab"
             }
+            None if pointer_on_locked_selection(session, x, y) => "not-allowed",
             None => "default",
         },
     };

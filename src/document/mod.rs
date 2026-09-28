@@ -15,6 +15,7 @@ pub use ops::rotate_bitmap;
 
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// How many undo steps to keep. Pixel-changing steps store full layer buffers.
 const UNDO_LIMIT: usize = 30;
@@ -140,8 +141,8 @@ pub struct Document {
     pub ppi: f32,
     pub background: Background,
     layers: Vec<Layer>,
-    /// The selected layer. `None` when nothing is selected.
-    active: Option<usize>,
+    /// Ids of the selected layers. Ids, unlike indices, survive a reorder.
+    selection: BTreeSet<u64>,
     next_id: u64,
 }
 
@@ -165,7 +166,7 @@ impl Document {
             ppi: spec.ppi,
             background: spec.background,
             layers: Vec::new(),
-            active: None,
+            selection: BTreeSet::new(),
             next_id: 1,
         };
         let layer = blank_layer(&mut doc, "Layer 1");
@@ -188,7 +189,7 @@ impl Document {
             ppi,
             background: Background::Transparent,
             layers: Vec::new(),
-            active: None,
+            selection: BTreeSet::new(),
             next_id: 1,
         };
         let mut layer = blank_layer(&mut doc, "Layer 1");
@@ -201,12 +202,39 @@ impl Document {
         &self.layers
     }
 
+    /// The selected layer when exactly one is selected. Single-layer edits,
+    /// such as opacity and the resize handles, act on it.
     pub fn active_index(&self) -> Option<usize> {
-        self.active
+        match self.selection.len() {
+            1 => self.selected_indices().first().copied(),
+            _ => None,
+        }
     }
 
     pub fn active_layer(&self) -> Option<&Layer> {
-        self.active.map(|index| &self.layers[index])
+        self.active_index().map(|index| &self.layers[index])
+    }
+
+    /// Selected layers, bottom to top.
+    pub fn selected_indices(&self) -> Vec<usize> {
+        (0..self.layers.len())
+            .filter(|&index| self.is_selected(index))
+            .collect()
+    }
+
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.layers
+            .get(index)
+            .is_some_and(|layer| self.selection.contains(&layer.id))
+    }
+
+    fn select_indices(&mut self, indices: &[usize]) -> Result<(), Error> {
+        let mut selection = BTreeSet::new();
+        for &index in indices {
+            selection.insert(self.layers.get(index).ok_or(Error::BadLayer)?.id);
+        }
+        self.selection = selection;
+        Ok(())
     }
 
     /// The topmost visible, unlocked layer with a non-transparent pixel at a
@@ -230,13 +258,50 @@ impl Document {
         })
     }
 
+    /// Visible, unlocked layers whose drawn pixels all fall inside `area`.
+    /// Only pixels on the canvas count, and a layer with none is skipped.
+    pub fn layers_within(&self, area: PixelRect) -> Vec<usize> {
+        let (ax0, ay0) = (area.x as i64, area.y as i64);
+        let (ax1, ay1) = (ax0 + area.width as i64, ay0 + area.height as i64);
+        (0..self.layers.len())
+            .filter(|&index| {
+                let layer = &self.layers[index];
+                if !layer.visible || layer.locked || layer.opacity <= 0.0 {
+                    return false;
+                }
+                let (ox, oy) = (layer.x as i64, layer.y as i64);
+                let x0 = ox.max(0);
+                let y0 = oy.max(0);
+                let x1 = (ox + layer.width() as i64).min(self.width as i64);
+                let y1 = (oy + layer.height() as i64).min(self.height as i64);
+                // Nothing drawn can be inside an area the layer doesn't reach.
+                if x0 >= ax1 || y0 >= ay1 || x1 <= ax0 || y1 <= ay0 {
+                    return false;
+                }
+                let mut found = false;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        if layer.pixels.get_pixel((x - ox) as u32, (y - oy) as u32)[3] == 0 {
+                            continue;
+                        }
+                        if x < ax0 || y < ay0 || x >= ax1 || y >= ay1 {
+                            return false;
+                        }
+                        found = true;
+                    }
+                }
+                found
+            })
+            .collect()
+    }
+
     fn layer_mut(&mut self, index: usize) -> Result<&mut Layer, Error> {
         self.layers.get_mut(index).ok_or(Error::BadLayer)
     }
 
     fn insert_layer(&mut self, layer: Layer) {
+        self.selection = BTreeSet::from([layer.id]);
         self.layers.push(layer);
-        self.active = Some(self.layers.len() - 1);
     }
 
     pub(crate) fn from_parts(
@@ -245,19 +310,20 @@ impl Document {
         ppi: f32,
         background: Background,
         layers: Vec<Layer>,
-        active: Option<usize>,
+        selected: &[usize],
         next_id: u64,
     ) -> Result<Self, Error> {
         check_size(width, height)?;
-        if layers.is_empty() || active.is_some_and(|index| index >= layers.len()) {
+        if layers.is_empty() || selected.iter().any(|&index| index >= layers.len()) {
             return Err(Error::BadProject);
         }
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for layer in &layers {
             if !seen.insert(layer.id) {
                 return Err(Error::BadProject);
             }
         }
+        let selection = selected.iter().map(|&index| layers[index].id).collect();
         Ok(Self {
             width,
             height,
@@ -268,7 +334,7 @@ impl Document {
             },
             background,
             layers,
-            active,
+            selection,
             next_id: next_id.max(1),
         })
     }
@@ -311,8 +377,9 @@ pub enum Command {
     DuplicateLayer {
         index: usize,
     },
-    DeleteLayer {
-        index: usize,
+    /// Remove every listed layer in one step.
+    DeleteLayers {
+        indices: Vec<usize>,
     },
     /// `to` is the index the layer occupies after the move.
     Reorder {
@@ -339,6 +406,12 @@ pub enum Command {
         index: usize,
         x: i32,
         y: i32,
+    },
+    /// Offset every listed layer by the same amount in one step.
+    MoveLayers {
+        indices: Vec<usize>,
+        dx: i32,
+        dy: i32,
     },
     Crop {
         x: i32,
@@ -389,7 +462,7 @@ impl Command {
             Self::AddLayer
                 | Self::AddImageLayer { .. }
                 | Self::DuplicateLayer { .. }
-                | Self::DeleteLayer { .. }
+                | Self::DeleteLayers { .. }
                 | Self::Crop { .. }
                 | Self::ScaleDocument { .. }
                 | Self::ScaleLayer { .. }
@@ -419,7 +492,7 @@ struct GeomSnap {
     height: u32,
     ppi: f32,
     background: Background,
-    active_id: Option<u64>,
+    selection: BTreeSet<u64>,
     layers: Vec<GeomLayer>,
 }
 
@@ -456,16 +529,26 @@ impl Editor {
         !self.redo.is_empty()
     }
 
+    /// Select only this layer.
     pub fn set_active(&mut self, index: usize) -> Result<(), Error> {
-        if index >= self.doc.layers.len() {
-            return Err(Error::BadLayer);
+        self.doc.select_indices(&[index])
+    }
+
+    pub fn set_selection(&mut self, indices: &[usize]) -> Result<(), Error> {
+        self.doc.select_indices(indices)
+    }
+
+    /// Add the layer to the selection, or take it out if it is already in.
+    pub fn toggle_selected(&mut self, index: usize) -> Result<(), Error> {
+        let id = self.doc.layers.get(index).ok_or(Error::BadLayer)?.id;
+        if !self.doc.selection.remove(&id) {
+            self.doc.selection.insert(id);
         }
-        self.doc.active = Some(index);
         Ok(())
     }
 
     pub fn deselect(&mut self) {
-        self.doc.active = None;
+        self.doc.selection.clear();
     }
 
     /// `Ok(true)` when the document changed. A valid no-op is `Ok(false)`.
@@ -521,7 +604,7 @@ fn geom_snap(doc: &Document) -> GeomSnap {
         height: doc.height,
         ppi: doc.ppi,
         background: doc.background,
-        active_id: doc.active.map(|index| doc.layers[index].id),
+        selection: doc.selection.clone(),
         layers: doc
             .layers
             .iter()
@@ -569,9 +652,7 @@ fn restore_geom(doc: &mut Document, snap: GeomSnap) {
         ordered.push(layer);
     }
     doc.layers = ordered;
-    doc.active = snap
-        .active_id
-        .and_then(|id| doc.layers.iter().position(|layer| layer.id == id));
+    doc.selection = snap.selection;
 }
 
 /// `Ok(false)` means the command is valid and would not change the document.
@@ -597,20 +678,27 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
             Ok(layer.x != *x || layer.y != *y)
         }
+        Command::MoveLayers { indices, dx, dy } => {
+            if indices.iter().any(|&index| index >= doc.layers.len()) {
+                return Err(Error::BadLayer);
+            }
+            Ok(!indices.is_empty() && (*dx != 0 || *dy != 0))
+        }
         Command::Reorder { from, to } => {
             if *from >= doc.layers.len() || *to >= doc.layers.len() {
                 return Err(Error::BadLayer);
             }
             Ok(from != to)
         }
-        Command::DeleteLayer { index } => {
-            if *index >= doc.layers.len() {
+        Command::DeleteLayers { indices } => {
+            if indices.iter().any(|&index| index >= doc.layers.len()) {
                 return Err(Error::BadLayer);
             }
-            if doc.layers.len() == 1 {
+            let unique: BTreeSet<_> = indices.iter().collect();
+            if unique.len() >= doc.layers.len() {
                 return Err(Error::LastLayer);
             }
-            Ok(true)
+            Ok(!unique.is_empty())
         }
         Command::RotateLayer { index, degrees_cw } => {
             if *index >= doc.layers.len() {
@@ -669,19 +757,21 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
 /// Refuse edits to a locked layer. Runs after [`command_changes`], so a no-op
 /// on a locked layer is still a quiet `Ok(false)`.
 fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
-    let index = match command {
+    let indices = match command {
         Command::SetOpacity { index, .. }
         | Command::MoveLayer { index, .. }
         | Command::ScaleLayer { index, .. }
         | Command::RotateLayer { index, .. }
-        | Command::FlipLayer { index, .. } => *index,
+        | Command::FlipLayer { index, .. } => std::slice::from_ref(index),
+        Command::MoveLayers { indices, .. } => indices.as_slice(),
         _ => return Ok(()),
     };
-    if doc.layers.get(index).ok_or(Error::BadLayer)?.locked {
-        Err(Error::Locked)
-    } else {
-        Ok(())
+    for &index in indices {
+        if doc.layers.get(index).ok_or(Error::BadLayer)?.locked {
+            return Err(Error::Locked);
+        }
     }
+    Ok(())
 }
 
 fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
@@ -722,17 +812,24 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             layer.pixels = source.pixels;
             doc.insert_layer(layer);
         }
-        Command::DeleteLayer { index } => {
-            if doc.layers.len() == 1 {
-                return Err(Error::LastLayer);
-            }
-            if index >= doc.layers.len() {
+        Command::DeleteLayers { indices } => {
+            let unique: BTreeSet<usize> = indices.into_iter().collect();
+            if unique.iter().any(|&index| index >= doc.layers.len()) {
                 return Err(Error::BadLayer);
             }
-            doc.layers.remove(index);
-            if let Some(active) = doc.active {
-                let active = if active > index { active - 1 } else { active };
-                doc.active = Some(active.min(doc.layers.len() - 1));
+            if unique.len() >= doc.layers.len() {
+                return Err(Error::LastLayer);
+            }
+            let lowest = *unique.first().ok_or(Error::BadLayer)?;
+            let mut removed_selected = false;
+            for &index in unique.iter().rev() {
+                let layer = doc.layers.remove(index);
+                removed_selected |= doc.selection.remove(&layer.id);
+            }
+            // Keep something selected so repeated deletes walk down the stack.
+            if removed_selected && doc.selection.is_empty() {
+                let next = lowest.min(doc.layers.len() - 1);
+                doc.selection.insert(doc.layers[next].id);
             }
         }
         Command::Reorder { from, to } => ops::reorder(doc, from, to)?,
@@ -752,6 +849,14 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             let layer = doc.layer_mut(index)?;
             layer.x = x;
             layer.y = y;
+        }
+        Command::MoveLayers { indices, dx, dy } => {
+            let unique: BTreeSet<usize> = indices.into_iter().collect();
+            for index in unique {
+                let layer = doc.layer_mut(index)?;
+                layer.x += dx;
+                layer.y += dy;
+            }
         }
         Command::Crop {
             x,
@@ -1028,7 +1133,9 @@ mod tests {
         assert!(editor.document().active_layer().is_none());
 
         editor.apply(Command::Reorder { from: 0, to: 2 }).unwrap();
-        editor.apply(Command::DeleteLayer { index: 1 }).unwrap();
+        editor
+            .apply(Command::DeleteLayers { indices: vec![1] })
+            .unwrap();
         assert_eq!(editor.document().active_index(), None);
 
         editor.set_active(0).unwrap();
@@ -1063,6 +1170,187 @@ mod tests {
         editor.set_active(0).unwrap();
         editor.undo();
         assert_eq!(editor.document().active_index(), None);
+    }
+
+    /// Three layers on an 8×8 canvas: an opaque background, a 2×2 square at
+    /// (1, 1), and a 2×2 square at (5, 5).
+    fn three_layers() -> Editor {
+        let mut editor = doc_with(8, 8, (0, 0), rgba(255, 0, 0, 255));
+        for pixel in editor.doc.layers[0].pixels.pixels_mut() {
+            *pixel = rgba(255, 255, 255, 255);
+        }
+        for origin in [1, 5] {
+            let mut square = RgbaImage::new(2, 2);
+            for pixel in square.pixels_mut() {
+                *pixel = rgba(0, 0, 255, 255);
+            }
+            editor
+                .apply(Command::AddImageLayer {
+                    name: format!("Square {origin}"),
+                    image: square,
+                })
+                .unwrap();
+            let last = editor.doc.layers.len() - 1;
+            editor.doc.layers[last].x = origin;
+            editor.doc.layers[last].y = origin;
+        }
+        editor
+    }
+
+    fn area(x: i32, y: i32, width: u32, height: u32) -> PixelRect {
+        PixelRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn layers_within_needs_every_drawn_pixel_inside_the_area() {
+        let editor = three_layers();
+        let doc = editor.document();
+        assert_eq!(doc.layers_within(area(0, 0, 8, 8)), vec![0, 1, 2]);
+        assert_eq!(doc.layers_within(area(1, 1, 7, 7)), vec![1, 2]);
+        assert_eq!(doc.layers_within(area(0, 0, 4, 4)), vec![1]);
+        assert_eq!(doc.layers_within(area(2, 2, 4, 4)), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn layers_within_skips_empty_hidden_and_locked_layers_and_clips_to_the_canvas() {
+        let mut editor = three_layers();
+        editor.apply(Command::AddLayer).unwrap();
+        editor
+            .apply(Command::SetVisibility {
+                index: 1,
+                visible: false,
+            })
+            .unwrap();
+        assert_eq!(
+            editor.document().layers_within(area(0, 0, 8, 8)),
+            vec![0, 2]
+        );
+
+        editor
+            .apply(Command::SetLocked {
+                index: 0,
+                locked: true,
+            })
+            .unwrap();
+        editor.doc.layers[2].x = 7;
+        assert_eq!(
+            editor.document().layers_within(area(6, 4, 2, 4)),
+            vec![2],
+            "the part of the square off the canvas does not count"
+        );
+    }
+
+    #[test]
+    fn several_selected_layers_have_no_single_active_layer() {
+        let mut editor = three_layers();
+        editor.set_selection(&[2, 1]).unwrap();
+        let doc = editor.document();
+        assert_eq!(doc.selected_indices(), vec![1, 2]);
+        assert_eq!(doc.active_index(), None);
+        assert!(doc.is_selected(1) && !doc.is_selected(0));
+
+        editor.toggle_selected(2).unwrap();
+        assert_eq!(editor.document().active_index(), Some(1));
+        editor.toggle_selected(0).unwrap();
+        assert_eq!(editor.document().selected_indices(), vec![0, 1]);
+        assert!(editor.set_selection(&[3]).is_err());
+    }
+
+    #[test]
+    fn the_selection_follows_layers_through_a_reorder() {
+        let mut editor = three_layers();
+        editor.set_selection(&[0, 2]).unwrap();
+        let ids: Vec<u64> = [0, 2].map(|index| editor.doc.layers[index].id).to_vec();
+        editor.apply(Command::Reorder { from: 0, to: 1 }).unwrap();
+        let selected: Vec<u64> = editor
+            .document()
+            .selected_indices()
+            .into_iter()
+            .map(|index| editor.doc.layers[index].id)
+            .collect();
+        assert_eq!(selected, ids);
+    }
+
+    #[test]
+    fn move_layers_offsets_each_layer_once_as_one_undo_step() {
+        let mut editor = three_layers();
+        editor
+            .apply(Command::MoveLayers {
+                indices: vec![1, 2, 2],
+                dx: 2,
+                dy: -1,
+            })
+            .unwrap();
+        let positions = |editor: &Editor| -> Vec<(i32, i32)> {
+            editor
+                .doc
+                .layers
+                .iter()
+                .map(|layer| (layer.x, layer.y))
+                .collect()
+        };
+        assert_eq!(positions(&editor), vec![(0, 0), (3, 0), (7, 4)]);
+        editor.undo();
+        assert_eq!(positions(&editor), vec![(0, 0), (1, 1), (5, 5)]);
+
+        editor
+            .apply(Command::SetLocked {
+                index: 2,
+                locked: true,
+            })
+            .unwrap();
+        let err = editor
+            .apply(Command::MoveLayers {
+                indices: vec![1, 2],
+                dx: 1,
+                dy: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Locked));
+        assert_eq!(positions(&editor), vec![(0, 0), (1, 1), (5, 5)]);
+    }
+
+    #[test]
+    fn deleting_several_layers_selects_the_one_that_takes_their_place() {
+        let mut editor = three_layers();
+        editor.apply(Command::AddLayer).unwrap();
+        let top = editor.doc.layers[3].id;
+        editor.set_selection(&[1, 2]).unwrap();
+        editor
+            .apply(Command::DeleteLayers {
+                indices: vec![1, 2],
+            })
+            .unwrap();
+        assert_eq!(editor.document().layers().len(), 2);
+        assert_eq!(editor.document().active_layer().unwrap().id, top);
+
+        let err = editor
+            .apply(Command::DeleteLayers {
+                indices: vec![0, 1],
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::LastLayer));
+    }
+
+    #[test]
+    fn deleting_unselected_layers_keeps_the_selection() {
+        let mut editor = three_layers();
+        editor.deselect();
+        editor
+            .apply(Command::DeleteLayers { indices: vec![1] })
+            .unwrap();
+        assert_eq!(editor.document().selected_indices(), Vec::<usize>::new());
+
+        editor.set_active(0).unwrap();
+        editor
+            .apply(Command::DeleteLayers { indices: vec![1] })
+            .unwrap();
+        assert_eq!(editor.document().active_index(), Some(0));
     }
 
     #[test]
@@ -1360,7 +1648,9 @@ mod tests {
     #[test]
     fn cannot_delete_the_last_layer() {
         let mut editor = doc_with(2, 2, (0, 0), rgba(0, 0, 0, 255));
-        let err = editor.apply(Command::DeleteLayer { index: 0 }).unwrap_err();
+        let err = editor
+            .apply(Command::DeleteLayers { indices: vec![0] })
+            .unwrap_err();
         assert!(matches!(err, Error::LastLayer));
     }
 

@@ -8,6 +8,7 @@ use pixel::document::{
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
+    Select,
     Move,
     Crop,
 }
@@ -21,10 +22,11 @@ pub struct CropDraft {
 }
 
 pub enum Preview {
+    /// Every listed layer offset by the same amount.
     Move {
-        index: usize,
-        x: i32,
-        y: i32,
+        indices: Vec<usize>,
+        dx: i32,
+        dy: i32,
     },
     Opacity {
         index: usize,
@@ -54,6 +56,8 @@ pub struct Session {
     pub fit_pending: bool,
     pub space_down: bool,
     pub crop: Option<CropDraft>,
+    /// The select tool's drag box, as two document-space corners.
+    pub marquee: Option<(f64, f64, f64, f64)>,
     pub preview: Option<Preview>,
     /// Bumped whenever the flattened image changes. Pan and zoom do not bump it.
     pub visual: u64,
@@ -72,13 +76,14 @@ impl Model {
             editor,
             path,
             dirty: false,
-            tool: Tool::Move,
+            tool: Tool::Select,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
             fit_pending: true,
             space_down: false,
             crop: None,
+            marquee: None,
             preview: None,
             visual: 1,
             cursor: None,
@@ -119,7 +124,20 @@ pub fn rendered(session: &Session) -> RgbaImage {
             }
         };
         let item = match *preview {
-            Preview::Move { index, x, y } => override_for(index, x, y, None),
+            Preview::Move {
+                ref indices,
+                dx,
+                dy,
+            } => {
+                let items = indices
+                    .iter()
+                    .map(|&index| {
+                        let layer = layer_at(index);
+                        override_for(index, layer.x + dx, layer.y + dy, None)
+                    })
+                    .collect();
+                return Some(items);
+            }
             Preview::Opacity { index, opacity } => {
                 let layer = layer_at(index);
                 LayerOverride {
@@ -159,15 +177,24 @@ pub fn rendered(session: &Session) -> RgbaImage {
 }
 
 /// Where the active layer is drawn, including an in-progress move, resize, or
-/// rotate. `None` when no layer is selected.
+/// rotate. `None` unless exactly one layer is selected.
 pub fn active_bounds(session: &Session) -> Option<PixelRect> {
+    let index = session.editor.document().active_index()?;
+    Some(layer_bounds(session, index))
+}
+
+/// Where a layer is drawn, including an in-progress move, resize, or rotate.
+pub fn layer_bounds(session: &Session, index: usize) -> PixelRect {
     let doc = session.editor.document();
-    let index = doc.active_index()?;
     let layer = &doc.layers()[index];
-    let bounds = match session.preview {
-        Some(Preview::Move { index: i, x, y }) if i == index => PixelRect {
-            x,
-            y,
+    match session.preview {
+        Some(Preview::Move {
+            ref indices,
+            dx,
+            dy,
+        }) if indices.contains(&index) => PixelRect {
+            x: layer.x + dx,
+            y: layer.y + dy,
             width: layer.width(),
             height: layer.height(),
         },
@@ -195,8 +222,7 @@ pub fn active_bounds(session: &Session) -> Option<PixelRect> {
             width: layer.width(),
             height: layer.height(),
         },
-    };
-    Some(bounds)
+    }
 }
 
 pub fn fit_view(session: &mut Session, alloc_w: i32, alloc_h: i32) {
