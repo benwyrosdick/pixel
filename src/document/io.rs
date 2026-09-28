@@ -445,6 +445,24 @@ mod tests {
     }
 
     #[test]
+    fn project_roundtrip_keeps_the_blend_mode() {
+        let mut editor = Editor::new(sample_doc());
+        editor
+            .apply(Command::SetBlend {
+                index: 0,
+                blend: BlendMode::SoftLight,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        assert_eq!(
+            open_project(&path).unwrap().layers()[0].blend,
+            BlendMode::SoftLight
+        );
+    }
+
+    #[test]
     fn project_roundtrip_keeps_guides() {
         let mut editor = Editor::new(sample_doc());
         editor

@@ -1,6 +1,6 @@
 //! Flatten a document to one RGBA image. Export and the viewport both use this.
 
-use super::{Background, Document};
+use super::{Background, BlendMode, Document};
 use image::{Rgba, RgbaImage};
 
 pub fn composite(doc: &Document) -> RgbaImage {
@@ -30,7 +30,7 @@ pub fn composite_with(doc: &Document, overrides: Option<&[LayerOverride]>) -> Rg
         let pixels = replacement
             .and_then(|item| item.pixels.as_ref())
             .unwrap_or(&layer.pixels);
-        blit_normal(&mut out, pixels, x, y, opacity);
+        blit(&mut out, pixels, x, y, opacity, layer.blend);
     }
     out
 }
@@ -42,7 +42,14 @@ pub fn composite_layers(doc: &Document, indices: &[usize]) -> Option<RgbaImage> 
     let mut out = RgbaImage::new(doc.width, doc.height);
     for (index, layer) in doc.layers.iter().enumerate() {
         if indices.contains(&index) && layer.visible && layer.opacity > 0.0 {
-            blit_normal(&mut out, &layer.pixels, layer.x, layer.y, layer.opacity);
+            blit(
+                &mut out,
+                &layer.pixels,
+                layer.x,
+                layer.y,
+                layer.opacity,
+                layer.blend,
+            );
         }
     }
     trim(&out)
@@ -72,7 +79,14 @@ pub struct LayerOverride {
     pub pixels: Option<RgbaImage>,
 }
 
-fn blit_normal(dst: &mut RgbaImage, src: &RgbaImage, origin_x: i32, origin_y: i32, opacity: f32) {
+fn blit(
+    dst: &mut RgbaImage,
+    src: &RgbaImage,
+    origin_x: i32,
+    origin_y: i32,
+    opacity: f32,
+    blend: BlendMode,
+) {
     let (dw, dh) = dst.dimensions();
     let (sw, sh) = src.dimensions();
     for sy in 0..sh {
@@ -90,12 +104,14 @@ fn blit_normal(dst: &mut RgbaImage, src: &RgbaImage, origin_x: i32, origin_y: i3
                 continue;
             }
             let dst_px = dst.get_pixel_mut(dx as u32, dy as u32);
-            over(dst_px, *src_px, opacity);
+            over(dst_px, *src_px, opacity, blend);
         }
     }
 }
 
-fn over(dst: &mut Rgba<u8>, src: Rgba<u8>, opacity: f32) {
+/// Source-over with a blend mode. Where the layer covers what is below, its
+/// color is the blend of both. Where nothing is below, it is the layer's own.
+fn over(dst: &mut Rgba<u8>, src: Rgba<u8>, opacity: f32, blend: BlendMode) {
     let src_a = src[3] as f32 / 255.0 * opacity;
     if src_a <= 0.0 {
         return;
@@ -109,7 +125,8 @@ fn over(dst: &mut Rgba<u8>, src: Rgba<u8>, opacity: f32) {
     for channel in 0..3 {
         let src_c = src[channel] as f32 / 255.0;
         let dst_c = dst[channel] as f32 / 255.0;
-        let out = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
+        let mixed = (1.0 - dst_a) * src_c + dst_a * blend.mix(dst_c, src_c);
+        let out = (mixed * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
         dst[channel] = (out * 255.0).round().clamp(0.0, 255.0) as u8;
     }
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;

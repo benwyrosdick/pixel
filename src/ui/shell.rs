@@ -14,10 +14,10 @@ use gtk::{gio, glib, prelude::*};
 use image::ImageReader;
 use libadwaita::prelude::*;
 use pixel::document::{
-    clockwise_delta, composite, composite_layers, export, hit_handle, open_image, open_project,
-    pointer_angle, resize_rect, save_project, snap_angle, Alignment, Axis, Command, Document,
-    Editor, ExportFormat, Guides, Handle, NewCanvas, PixelRect, QuarterTurn, ScaleFilter,
-    HANDLE_RADIUS, ROTATE_OFFSET,
+    adjust, clockwise_delta, composite, composite_layers, export, hit_handle, open_image,
+    open_project, pointer_angle, resize_rect, save_project, snap_angle, Adjustment, Alignment,
+    Axis, BlendMode, Command, Document, Editor, ExportFormat, Guides, Handle, NewCanvas, PixelRect,
+    QuarterTurn, ScaleFilter, HANDLE_RADIUS, ROTATE_OFFSET,
 };
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -53,6 +53,10 @@ pub struct Shell {
     recent_group: gtk::Box,
     /// The files behind the welcome screen's rows, in row order.
     recent_paths: RefCell<Vec<PathBuf>>,
+    /// The latest adjustment waiting to be previewed. Sliders move faster
+    /// than a large layer can be redrawn, so only the newest one runs.
+    pending_adjustment: RefCell<Option<(usize, Adjustment)>>,
+    adjustment_queued: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -292,6 +296,8 @@ impl Shell {
             recent_list,
             recent_group,
             recent_paths: RefCell::new(Vec::new()),
+            pending_adjustment: RefCell::new(None),
+            adjustment_queued: Cell::new(false),
         });
         shell.bind(&new_canvas, &open_image, &open_project, &fit, &actual);
         shell.refresh();
@@ -460,6 +466,9 @@ impl Shell {
         });
         self.add_action("delete-layer", &[], |shell| shell.delete_selected());
         self.add_action("rotate-layer", &[], |shell| shell.rotate_layer());
+        for (name, _) in ADJUSTMENTS {
+            self.add_action(name, &[], move |shell| shell.open_adjustment(name));
+        }
         self.add_action("flip-layer-h", &[], |shell| {
             if let Some(index) = shell.active_index() {
                 shell.edit(Command::FlipLayer {
@@ -723,6 +732,84 @@ impl Shell {
         }
     }
 
+    /// Grayscale applies at once. The others open a dialog that previews on
+    /// the canvas until it is applied or cancelled.
+    fn open_adjustment(self: &Rc<Self>, name: &str) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let Some((sliders, make)) = adjustment_form(name) else {
+            self.edit(Command::Adjust {
+                index,
+                adjustment: Adjustment::Grayscale,
+            });
+            return;
+        };
+        let title = ADJUSTMENTS
+            .iter()
+            .find(|(action, _)| *action == name)
+            .map_or(name, |(_, label)| label.trim_end_matches('…'));
+        let (preview, apply, cancel) = (self.clone(), self.clone(), self.clone());
+        dialogs::adjustment(
+            &self.window,
+            title,
+            &sliders,
+            move |values| preview.preview_adjustment(index, make(values)),
+            move |values| apply.apply_adjustment(index, make(values)),
+            move || cancel.cancel_adjustment(),
+        );
+    }
+
+    /// Show `adjustment` on the canvas without changing the document. Only
+    /// the latest one is drawn, once the pending events are handled.
+    fn preview_adjustment(self: &Rc<Self>, index: usize, adjustment: Adjustment) {
+        *self.pending_adjustment.borrow_mut() = Some((index, adjustment));
+        if self.adjustment_queued.replace(true) {
+            return;
+        }
+        let shell = self.clone();
+        glib::idle_add_local_once(move || {
+            shell.adjustment_queued.set(false);
+            let Some((index, adjustment)) = shell.pending_adjustment.borrow_mut().take() else {
+                return;
+            };
+            if let Some(session) = shell.model.borrow_mut().session.as_mut() {
+                let Some(layer) = session.editor.document().layers().get(index) else {
+                    return;
+                };
+                let pixels = adjust(&layer.pixels, adjustment);
+                session.preview = Some(Preview::Pixels { index, pixels });
+                session.visual = session.visual.wrapping_add(1);
+            }
+            shell.canvas.queue_draw();
+        });
+    }
+
+    fn apply_adjustment(self: &Rc<Self>, index: usize, adjustment: Adjustment) {
+        self.pending_adjustment.borrow_mut().take();
+        if let Some(session) = self.model.borrow_mut().session.as_mut() {
+            session.preview = None;
+        }
+        self.edit(Command::Adjust { index, adjustment });
+    }
+
+    fn cancel_adjustment(&self) {
+        self.pending_adjustment.borrow_mut().take();
+        if let Some(session) = self.model.borrow_mut().session.as_mut() {
+            if matches!(session.preview, Some(Preview::Pixels { .. })) {
+                session.preview = None;
+                session.visual = session.visual.wrapping_add(1);
+            }
+        }
+        self.canvas.queue_draw();
+    }
+
+    pub fn set_active_blend(self: &Rc<Self>, blend: BlendMode) {
+        if let Some(index) = self.active_index() {
+            self.edit(Command::SetBlend { index, blend });
+        }
+    }
+
     /// Run an align or distribute command on the selection.
     fn arrange(self: &Rc<Self>, command: impl FnOnce(Vec<usize>) -> Command) {
         let indices = self
@@ -969,6 +1056,9 @@ impl Shell {
             for name in ["rotate-layer", "flip-layer-h", "flip-layer-v"] {
                 self.enable(name, editable);
             }
+            for (name, _) in ADJUSTMENTS {
+                self.enable(name, editable);
+            }
             drop(model);
             self.fill_tool_options();
             let model = self.model.borrow();
@@ -1020,6 +1110,12 @@ impl Shell {
             "duplicate",
             "delete-layer",
             "rotate-layer",
+            "brightness-contrast",
+            "hue-saturation",
+            "levels",
+            "grayscale",
+            "blur",
+            "sharpen",
             "flip-layer-h",
             "flip-layer-v",
             "raise",
@@ -2377,6 +2473,31 @@ fn app_menu(recent: &gio::Menu) -> gio::Menu {
         menu.append_item(&menu_item("Lower", "lower"));
         menu
     });
+    menu.append_submenu(Some("Adjust"), &{
+        let menu = gio::Menu::new();
+        let section = |names: &[&str]| {
+            let section = gio::Menu::new();
+            for name in names {
+                let (_, label) = ADJUSTMENTS
+                    .iter()
+                    .find(|(action, _)| action == name)
+                    .expect("every listed adjustment has a label");
+                section.append_item(&menu_item(label, name));
+            }
+            section
+        };
+        menu.append_section(
+            None,
+            &section(&[
+                "brightness-contrast",
+                "hue-saturation",
+                "levels",
+                "grayscale",
+            ]),
+        );
+        menu.append_section(None, &section(&["blur", "sharpen"]));
+        menu
+    });
     menu.append_submenu(Some("Selection"), &{
         let menu = gio::Menu::new();
         menu.append_section(None, &{
@@ -2479,6 +2600,82 @@ fn texture_image(texture: &gdk::Texture) -> image::RgbaImage {
         pixels.extend_from_slice(&bytes[y * stride..y * stride + row]);
     }
     image::RgbaImage::from_raw(width, height, pixels).expect("each row is width × 4 bytes")
+}
+
+/// Adjustment and filter actions, with their menu labels. Each rewrites the
+/// one selected layer's pixels.
+const ADJUSTMENTS: [(&str, &str); 6] = [
+    ("brightness-contrast", "Brightness and Contrast…"),
+    ("hue-saturation", "Hue and Saturation…"),
+    ("levels", "Levels…"),
+    ("grayscale", "Grayscale"),
+    ("blur", "Blur…"),
+    ("sharpen", "Sharpen…"),
+];
+
+/// The sliders an adjustment's dialog shows, and how their values become the
+/// adjustment. `None` for one that applies straight away.
+fn adjustment_form(name: &str) -> Option<(Vec<dialogs::Slider>, fn(&[f64]) -> Adjustment)> {
+    let slider = |label, min, max, value, digits| dialogs::Slider {
+        label,
+        min,
+        max,
+        value,
+        digits,
+    };
+    let form: (Vec<dialogs::Slider>, fn(&[f64]) -> Adjustment) = match name {
+        "brightness-contrast" => (
+            vec![
+                slider("Brightness", -100.0, 100.0, 0.0, 0),
+                slider("Contrast", -100.0, 100.0, 0.0, 0),
+            ],
+            |v| Adjustment::BrightnessContrast {
+                brightness: v[0] as f32,
+                contrast: v[1] as f32,
+            },
+        ),
+        "hue-saturation" => (
+            vec![
+                slider("Hue", -180.0, 180.0, 0.0, 0),
+                slider("Saturation", -100.0, 100.0, 0.0, 0),
+                slider("Lightness", -100.0, 100.0, 0.0, 0),
+            ],
+            |v| Adjustment::HueSaturation {
+                hue: v[0] as f32,
+                saturation: v[1] as f32,
+                lightness: v[2] as f32,
+            },
+        ),
+        "levels" => (
+            vec![
+                slider("Black point", 0.0, 254.0, 0.0, 0),
+                slider("White point", 1.0, 255.0, 255.0, 0),
+                slider("Midtones", 0.1, 5.0, 1.0, 2),
+            ],
+            |v| Adjustment::Levels {
+                black: v[0].round() as u8,
+                white: v[1].round() as u8,
+                gamma: v[2] as f32,
+            },
+        ),
+        "blur" => (vec![slider("Radius", 0.0, 50.0, 2.0, 1)], |v| {
+            Adjustment::Blur {
+                radius: v[0] as f32,
+            }
+        }),
+        "sharpen" => (
+            vec![
+                slider("Amount", 0.0, 500.0, 100.0, 0),
+                slider("Radius", 0.1, 10.0, 1.0, 1),
+            ],
+            |v| Adjustment::Sharpen {
+                amount: v[0] as f32,
+                radius: v[1] as f32,
+            },
+        ),
+        _ => return None,
+    };
+    Some(form)
 }
 
 /// Align actions. A single layer aligns to the canvas.

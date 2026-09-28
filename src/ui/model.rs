@@ -43,6 +43,11 @@ pub enum Preview {
         index: usize,
         degrees_cw: f32,
     },
+    /// An adjustment or filter being tried out on one layer.
+    Pixels {
+        index: usize,
+        pixels: RgbaImage,
+    },
 }
 
 pub struct Session {
@@ -202,6 +207,10 @@ pub fn rendered(session: &Session) -> RgbaImage {
                 let layer = layer_at(index);
                 let (pixels, x, y) = rotate_bitmap(&layer.pixels, layer.x, layer.y, degrees_cw);
                 override_for(index, x, y, Some(pixels))
+            }
+            Preview::Pixels { index, ref pixels } => {
+                let layer = layer_at(index);
+                override_for(index, layer.x, layer.y, Some(pixels.clone()))
             }
         };
         Some(vec![item])

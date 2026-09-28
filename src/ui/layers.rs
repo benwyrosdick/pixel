@@ -1,19 +1,25 @@
-//! The layer list, opacity slider, position and size fields, and layer buttons.
+//! The layer list with thumbnails, the blend mode, opacity slider, position
+//! and size fields, and layer buttons.
 
+use super::canvas::upload;
 use super::model::Session;
 use super::shell::Shell;
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
-use pixel::document::{Command, Layer, PixelRect, MAX_EDGE};
-use std::cell::Cell;
+use pixel::document::{BlendMode, Command, Layer, PixelRect, MAX_EDGE};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub struct LayersPanel {
     pub root: gtk::Box,
     list: gtk::ListBox,
     opacity: gtk::Scale,
+    blend: gtk::DropDown,
     geometry: Geometry,
+    /// Thumbnails by layer id, with the pixel buffer each was made from.
+    thumbnails: RefCell<HashMap<u64, Thumbnail>>,
     updating: Rc<Cell<bool>>,
     dragging: Rc<Cell<bool>>,
     opacity_before: Rc<Cell<f32>>,
@@ -72,6 +78,19 @@ impl LayersPanel {
         root.append(&gtk::Label::builder().label("Opacity").xalign(0.0).build());
         root.append(&opacity);
 
+        let labels: Vec<&str> = BlendMode::ALL
+            .iter()
+            .map(|&mode| blend_label(mode))
+            .collect();
+        let blend = gtk::DropDown::from_strings(&labels);
+        blend.set_hexpand(true);
+        blend.set_tooltip_text(Some("How the layer mixes with the layers under it"));
+        let blend_row = gtk::Grid::new();
+        blend_row.set_column_spacing(8);
+        blend_row.attach(&gtk::Label::new(Some("Blend")), 0, 0, 1, 1);
+        blend_row.attach(&blend, 1, 0, 1, 1);
+        root.append(&blend_row);
+
         let geometry = Geometry::new();
         root.append(
             &gtk::Label::builder()
@@ -85,7 +104,9 @@ impl LayersPanel {
             root,
             list,
             opacity,
+            blend,
             geometry,
+            thumbnails: RefCell::new(HashMap::new()),
             updating: Rc::new(Cell::new(false)),
             dragging: Rc::new(Cell::new(false)),
             opacity_before: Rc::new(Cell::new(1.0)),
@@ -176,6 +197,17 @@ impl LayersPanel {
             }
         });
 
+        let updating = self.updating.clone();
+        let shell_blend = shell.clone();
+        self.blend.connect_selected_notify(move |dropdown| {
+            if updating.get() {
+                return;
+            }
+            if let Some(&blend) = BlendMode::ALL.get(dropdown.selected() as usize) {
+                shell_blend.set_active_blend(blend);
+            }
+        });
+
         self.geometry.connect(shell, &self.updating);
     }
 
@@ -186,8 +218,13 @@ impl LayersPanel {
             self.list.remove(&row);
         }
         let doc = session.editor.document();
+        self.thumbnails
+            .borrow_mut()
+            .retain(|id, _| doc.layers().iter().any(|layer| layer.id == *id));
         for (index, layer) in doc.layers().iter().enumerate().rev() {
-            self.list.append(&layer_row(shell, index, layer));
+            let thumbnail = self.thumbnail(layer);
+            self.list
+                .append(&layer_row(shell, index, layer, &thumbnail));
         }
         // Removing the focused row makes GTK move focus back into the list
         // later, and a row that gains focus that way gets selected. That
@@ -213,6 +250,12 @@ impl LayersPanel {
         }
         self.opacity
             .set_sensitive(active.is_some_and(|layer| !layer.locked));
+        if let Some(layer) = active {
+            let position = BlendMode::ALL.iter().position(|&mode| mode == layer.blend);
+            self.blend.set_selected(position.unwrap_or(0) as u32);
+        }
+        self.blend
+            .set_sensitive(active.is_some_and(|layer| !layer.locked));
         self.geometry.show(active);
         let buttons = self.buttons();
         for button in [&buttons.duplicate, &buttons.up, &buttons.down] {
@@ -222,6 +265,30 @@ impl LayersPanel {
             .delete
             .set_sensitive(!doc.selected_indices().is_empty());
         self.updating.set(false);
+    }
+
+    /// The layer's thumbnail, remade only when its pixels change. Every edit
+    /// that changes pixels puts them in a new buffer, so a buffer's address
+    /// and size tell whether a cached thumbnail is still current.
+    fn thumbnail(&self, layer: &Layer) -> gdk::Texture {
+        let key = (
+            layer.pixels.as_raw().as_ptr() as usize,
+            layer.width(),
+            layer.height(),
+        );
+        let mut cache = self.thumbnails.borrow_mut();
+        if let Some(cached) = cache.get(&layer.id).filter(|cached| cached.key == key) {
+            return cached.texture.clone();
+        }
+        let texture = upload(&thumbnail_image(&layer.pixels)).upcast::<gdk::Texture>();
+        cache.insert(
+            layer.id,
+            Thumbnail {
+                key,
+                texture: texture.clone(),
+            },
+        );
+        texture
     }
 
     /// The position of the row that has keyboard focus, or holds the widget
@@ -381,7 +448,66 @@ pub struct LayerButtons {
     pub down: gtk::Button,
 }
 
-fn layer_row(shell: &Rc<Shell>, index: usize, layer: &Layer) -> gtk::ListBoxRow {
+struct Thumbnail {
+    key: (usize, u32, u32),
+    texture: gdk::Texture,
+}
+
+/// How big a thumbnail draws, in screen pixels. It is rendered at twice that
+/// so it stays sharp on high-density screens.
+const THUMBNAIL_SIZE: i32 = 32;
+
+/// The layer's pixels fitted into a thumbnail, over a checkerboard so
+/// transparent areas read as transparent.
+fn thumbnail_image(pixels: &image::RgbaImage) -> image::RgbaImage {
+    let size = THUMBNAIL_SIZE as u32 * 2;
+    let (w, h) = pixels.dimensions();
+    let scale = size as f64 / w.max(h) as f64;
+    let tw = ((w as f64 * scale).round() as u32).clamp(1, size);
+    let th = ((h as f64 * scale).round() as u32).clamp(1, size);
+    let mut small = if scale < 1.0 {
+        image::imageops::thumbnail(pixels, tw, th)
+    } else {
+        image::imageops::resize(pixels, tw, th, image::imageops::FilterType::Nearest)
+    };
+    for (x, y, pixel) in small.enumerate_pixels_mut() {
+        let square = if (x / 8 + y / 8) % 2 == 0 {
+            204.0
+        } else {
+            153.0
+        };
+        let alpha = pixel[3] as f32 / 255.0;
+        for channel in 0..3 {
+            pixel[channel] = (pixel[channel] as f32 * alpha + square * (1.0 - alpha)).round() as u8;
+        }
+        pixel[3] = 255;
+    }
+    small
+}
+
+fn blend_label(mode: BlendMode) -> &'static str {
+    match mode {
+        BlendMode::Normal => "Normal",
+        BlendMode::Multiply => "Multiply",
+        BlendMode::Screen => "Screen",
+        BlendMode::Overlay => "Overlay",
+        BlendMode::Darken => "Darken",
+        BlendMode::Lighten => "Lighten",
+        BlendMode::ColorDodge => "Color Dodge",
+        BlendMode::ColorBurn => "Color Burn",
+        BlendMode::HardLight => "Hard Light",
+        BlendMode::SoftLight => "Soft Light",
+        BlendMode::Difference => "Difference",
+        BlendMode::Exclusion => "Exclusion",
+    }
+}
+
+fn layer_row(
+    shell: &Rc<Shell>,
+    index: usize,
+    layer: &Layer,
+    thumbnail: &gdk::Texture,
+) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.add_css_class("pixel-layer");
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -519,8 +645,18 @@ fn layer_row(shell: &Rc<Shell>, index: usize, layer: &Layer) -> gtk::ListBoxRow 
     });
     row.add_controller(rename_click);
 
+    let picture = gtk::Picture::for_paintable(thumbnail);
+    picture.set_size_request(THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_can_target(false);
+
+    // Rows are as tall as the thumbnail. Keep the toggles their own size.
+    eye.set_valign(gtk::Align::Center);
+    lock.set_valign(gtk::Align::Center);
     content.append(&eye);
     content.append(&lock);
+    content.append(&picture);
     content.append(&name_box);
     row.set_child(Some(&content));
 

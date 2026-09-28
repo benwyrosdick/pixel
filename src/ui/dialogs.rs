@@ -1,7 +1,7 @@
-//! Modal dialogs for canvas setup, resize, rotate, and export.
+//! Modal dialogs for canvas setup, resize, rotate, adjustments, and export.
 
-use gtk::gdk;
 use gtk::prelude::*;
+use gtk::{gdk, glib};
 use pixel::document::{Anchor, Background, ExportFormat, NewCanvas, ScaleFilter, MAX_EDGE};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -242,6 +242,79 @@ pub fn rotate_layer(parent: &impl IsA<gtk::Window>, on_ok: impl Fn(f32) + 'stati
     dialog.set_default_widget(Some(&apply));
     dialog.set_child(Some(&form));
     dialog.present();
+}
+
+/// One slider in an adjustment dialog.
+pub struct Slider {
+    pub label: &'static str,
+    pub min: f64,
+    pub max: f64,
+    pub value: f64,
+    /// Decimal places shown and stepped.
+    pub digits: u32,
+}
+
+/// A dialog of sliders for an adjustment or filter. `preview` runs with the
+/// slider values when it opens and whenever one moves, `on_ok` when the change
+/// is applied, and `on_cancel` when the dialog closes any other way.
+pub fn adjustment(
+    parent: &impl IsA<gtk::Window>,
+    title: &str,
+    sliders: &[Slider],
+    preview: impl Fn(&[f64]) + 'static,
+    on_ok: impl Fn(&[f64]) + 'static,
+    on_cancel: impl Fn() + 'static,
+) {
+    let dialog = form_window(parent, title);
+    let form = padded_column();
+    let scales: Vec<gtk::Scale> = sliders
+        .iter()
+        .map(|slider| {
+            let step = 10f64.powi(-(slider.digits as i32));
+            let scale =
+                gtk::Scale::with_range(gtk::Orientation::Horizontal, slider.min, slider.max, step);
+            scale.set_digits(slider.digits as i32);
+            scale.set_draw_value(true);
+            scale.set_value_pos(gtk::PositionType::Right);
+            scale.set_value(slider.value);
+            scale.set_hexpand(true);
+            form.append(&labeled(slider.label, &scale));
+            scale
+        })
+        .collect();
+    let values = {
+        let scales = scales.clone();
+        move || scales.iter().map(|scale| scale.value()).collect::<Vec<_>>()
+    };
+    let preview = Rc::new(preview);
+    for scale in &scales {
+        let preview = preview.clone();
+        let values = values.clone();
+        scale.connect_value_changed(move |_| preview(&values()));
+    }
+
+    let applied = Rc::new(Cell::new(false));
+    let apply = gtk::Button::with_label("Apply");
+    apply.add_css_class("suggested-action");
+    let dialog_ok = dialog.clone();
+    let applied_ok = applied.clone();
+    let apply_values = values.clone();
+    apply.connect_clicked(move |_| {
+        applied_ok.set(true);
+        on_ok(&apply_values());
+        dialog_ok.close();
+    });
+    dialog.connect_close_request(move |_| {
+        if !applied.get() {
+            on_cancel();
+        }
+        glib::Propagation::Proceed
+    });
+    form.append(&button_row(&cancel_button(&dialog), &apply));
+    dialog.set_default_widget(Some(&apply));
+    dialog.set_child(Some(&form));
+    dialog.present();
+    preview(&values());
 }
 
 pub fn export_options(

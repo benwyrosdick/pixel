@@ -1,11 +1,13 @@
 //! A layered raster document and the undoable commands that edit it.
 
+mod adjust;
 mod arrange;
 mod composite;
 mod handles;
 mod io;
 mod ops;
 
+pub use adjust::{adjust, Adjustment};
 pub use composite::{composite, composite_layers, composite_with, LayerOverride};
 pub use handles::{
     clockwise_delta, hit_handle, pointer_angle, resize_rect, rotate_handle_point, rotated_bounds,
@@ -46,9 +48,94 @@ pub enum Error {
     Locked,
 }
 
+/// How a layer's colors mix with the layers under it. The formulas are the
+/// W3C Compositing and Blending ones, which most editors share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlendMode {
     Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+}
+
+impl BlendMode {
+    /// Every mode, in the order menus list them.
+    pub const ALL: [BlendMode; 12] = [
+        Self::Normal,
+        Self::Multiply,
+        Self::Screen,
+        Self::Overlay,
+        Self::Darken,
+        Self::Lighten,
+        Self::ColorDodge,
+        Self::ColorBurn,
+        Self::HardLight,
+        Self::SoftLight,
+        Self::Difference,
+        Self::Exclusion,
+    ];
+
+    /// The mixed color of one channel, from the color below (`cb`) and the
+    /// layer's color (`cs`), both from 0 to 1.
+    pub fn mix(self, cb: f32, cs: f32) -> f32 {
+        let screen = |b: f32, s: f32| b + s - b * s;
+        let hard_light = |b: f32, s: f32| {
+            if s <= 0.5 {
+                b * 2.0 * s
+            } else {
+                screen(b, 2.0 * s - 1.0)
+            }
+        };
+        match self {
+            Self::Normal => cs,
+            Self::Multiply => cb * cs,
+            Self::Screen => screen(cb, cs),
+            Self::Overlay => hard_light(cs, cb),
+            Self::Darken => cb.min(cs),
+            Self::Lighten => cb.max(cs),
+            Self::ColorDodge => {
+                if cb <= 0.0 {
+                    0.0
+                } else if cs >= 1.0 {
+                    1.0
+                } else {
+                    (cb / (1.0 - cs)).min(1.0)
+                }
+            }
+            Self::ColorBurn => {
+                if cb >= 1.0 {
+                    1.0
+                } else if cs <= 0.0 {
+                    0.0
+                } else {
+                    1.0 - ((1.0 - cb) / cs).min(1.0)
+                }
+            }
+            Self::HardLight => hard_light(cb, cs),
+            Self::SoftLight => {
+                if cs <= 0.5 {
+                    cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+                } else {
+                    let d = if cb <= 0.25 {
+                        ((16.0 * cb - 12.0) * cb + 4.0) * cb
+                    } else {
+                        cb.sqrt()
+                    };
+                    cb + (2.0 * cs - 1.0) * (d - cb)
+                }
+            }
+            Self::Difference => (cb - cs).abs(),
+            Self::Exclusion => cb + cs - 2.0 * cb * cs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,6 +581,15 @@ pub enum Command {
         index: usize,
         opacity: f32,
     },
+    SetBlend {
+        index: usize,
+        blend: BlendMode,
+    },
+    /// Rewrite one layer's pixels with a color adjustment or filter.
+    Adjust {
+        index: usize,
+        adjustment: Adjustment,
+    },
     MoveLayer {
         index: usize,
         x: i32,
@@ -580,6 +676,7 @@ impl Command {
                 | Self::RotateLayer { .. }
                 | Self::FlipCanvas { .. }
                 | Self::FlipLayer { .. }
+                | Self::Adjust { .. }
         )
     }
 }
@@ -801,6 +898,14 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             Ok(!arrange::align_shifts(doc, indices, *to)?.is_empty())
         }
         Command::SetGuides { guides } => Ok(doc.guides != *guides),
+        Command::SetBlend { index, blend } => {
+            let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            Ok(layer.blend != *blend)
+        }
+        Command::Adjust { index, adjustment } => {
+            doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            Ok(!adjustment.is_identity())
+        }
         Command::DistributeLayers { indices, axis } => {
             Ok(!arrange::distribute_shifts(doc, indices, *axis)?.is_empty())
         }
@@ -879,6 +984,8 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
 fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
     let indices = match command {
         Command::SetOpacity { index, .. }
+        | Command::SetBlend { index, .. }
+        | Command::Adjust { index, .. }
         | Command::MoveLayer { index, .. }
         | Command::ScaleLayer { index, .. }
         | Command::RotateLayer { index, .. }
@@ -992,6 +1099,11 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             shift_layers(doc, shifts)?;
         }
         Command::SetGuides { guides } => doc.guides = guides,
+        Command::SetBlend { index, blend } => doc.layer_mut(index)?.blend = blend,
+        Command::Adjust { index, adjustment } => {
+            let layer = doc.layer_mut(index)?;
+            layer.pixels = adjust(&layer.pixels, adjustment);
+        }
         Command::DistributeLayers { indices, axis } => {
             let shifts = arrange::distribute_shifts(doc, &indices, axis)?;
             shift_layers(doc, shifts)?;
@@ -1487,6 +1599,96 @@ mod tests {
             })
             .unwrap();
         assert_eq!(guides_of(&editor), (vec![14], vec![2]));
+    }
+
+    /// A 1×1 document: `below` on the first layer, `above` on a second one
+    /// with `blend`.
+    fn blended(below: Rgba<u8>, above: Rgba<u8>, blend: BlendMode) -> Rgba<u8> {
+        let mut editor = doc_with(1, 1, (0, 0), below);
+        editor.apply(Command::AddLayer).unwrap();
+        editor.doc.layers[1].pixels.put_pixel(0, 0, above);
+        editor
+            .apply(Command::SetBlend { index: 1, blend })
+            .unwrap_or(false);
+        *composite(editor.document()).get_pixel(0, 0)
+    }
+
+    #[test]
+    fn blend_modes_mix_with_what_is_below() {
+        let white = rgba(255, 255, 255, 255);
+        let gray = rgba(128, 128, 128, 255);
+        let black = rgba(0, 0, 0, 255);
+        assert_eq!(blended(white, gray, BlendMode::Multiply), gray);
+        assert_eq!(blended(black, gray, BlendMode::Screen), gray);
+        assert_eq!(
+            blended(white, gray, BlendMode::Difference),
+            rgba(127, 127, 127, 255)
+        );
+        assert_eq!(blended(black, white, BlendMode::Darken), black);
+        assert_eq!(blended(gray, gray, BlendMode::Normal), gray);
+    }
+
+    #[test]
+    fn a_blend_mode_over_nothing_shows_the_layer_as_it_is() {
+        let clear = rgba(0, 0, 0, 0);
+        let red = rgba(200, 30, 30, 255);
+        for blend in BlendMode::ALL {
+            assert_eq!(blended(clear, red, blend), red, "{blend:?}");
+        }
+    }
+
+    #[test]
+    fn setting_a_blend_mode_is_undoable_and_respects_the_lock() {
+        let mut editor = doc_with(1, 1, (0, 0), rgba(0, 0, 0, 255));
+        assert!(editor
+            .apply(Command::SetBlend {
+                index: 0,
+                blend: BlendMode::Screen,
+            })
+            .unwrap());
+        editor.undo();
+        assert_eq!(editor.document().layers[0].blend, BlendMode::Normal);
+        editor
+            .apply(Command::SetLocked {
+                index: 0,
+                locked: true,
+            })
+            .unwrap();
+        for command in [
+            Command::SetBlend {
+                index: 0,
+                blend: BlendMode::Screen,
+            },
+            Command::Adjust {
+                index: 0,
+                adjustment: Adjustment::Grayscale,
+            },
+        ] {
+            assert!(matches!(editor.apply(command), Err(Error::Locked)));
+        }
+    }
+
+    #[test]
+    fn an_adjustment_is_one_undo_step_and_a_no_op_is_skipped() {
+        let mut editor = doc_with(1, 1, (0, 0), rgba(0, 255, 0, 255));
+        assert!(!editor
+            .apply(Command::Adjust {
+                index: 0,
+                adjustment: Adjustment::Blur { radius: 0.0 },
+            })
+            .unwrap());
+        editor
+            .apply(Command::Adjust {
+                index: 0,
+                adjustment: Adjustment::Grayscale,
+            })
+            .unwrap();
+        assert_eq!(editor.document().layers[0].pixels.get_pixel(0, 0)[0], 182);
+        editor.undo();
+        assert_eq!(
+            editor.document().layers[0].pixels.get_pixel(0, 0),
+            &rgba(0, 255, 0, 255)
+        );
     }
 
     #[test]
