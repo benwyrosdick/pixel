@@ -173,15 +173,31 @@ impl LayersPanel {
         for (index, layer) in doc.layers().iter().enumerate().rev() {
             self.list.append(&layer_row(shell, index, layer));
         }
-        let visual = doc.layers().len() as i32 - 1 - doc.active_index() as i32;
-        if let Some(row) = self.list.row_at_index(visual) {
-            self.list.select_row(Some(&row));
+        match doc.active_index() {
+            Some(index) => {
+                let visual = (doc.layers().len() - 1 - index) as i32;
+                if let Some(row) = self.list.row_at_index(visual) {
+                    self.list.select_row(Some(&row));
+                }
+            }
+            None => self.list.unselect_all(),
         }
+        let active = doc.active_layer();
         if !self.dragging.get() {
-            let opacity = doc.active_layer().opacity * 100.0;
+            let opacity = active.map_or(1.0, |layer| layer.opacity) * 100.0;
             self.opacity.set_value(opacity as f64);
         }
-        self.opacity.set_sensitive(!doc.active_layer().locked);
+        self.opacity
+            .set_sensitive(active.is_some_and(|layer| !layer.locked));
+        let buttons = self.buttons();
+        for button in [
+            &buttons.duplicate,
+            &buttons.delete,
+            &buttons.up,
+            &buttons.down,
+        ] {
+            button.set_sensitive(active.is_some());
+        }
         self.updating.set(false);
     }
 

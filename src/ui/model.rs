@@ -158,12 +158,13 @@ pub fn rendered(session: &Session) -> RgbaImage {
     composite_with(doc, overrides.as_deref())
 }
 
-/// Where the active layer is drawn, including an in-progress move, resize, or rotate.
-pub fn active_bounds(session: &Session) -> PixelRect {
+/// Where the active layer is drawn, including an in-progress move, resize, or
+/// rotate. `None` when no layer is selected.
+pub fn active_bounds(session: &Session) -> Option<PixelRect> {
     let doc = session.editor.document();
-    let index = doc.active_index();
-    let layer = doc.active_layer();
-    match session.preview {
+    let index = doc.active_index()?;
+    let layer = &doc.layers()[index];
+    let bounds = match session.preview {
         Some(Preview::Move { index: i, x, y }) if i == index => PixelRect {
             x,
             y,
@@ -194,7 +195,8 @@ pub fn active_bounds(session: &Session) -> PixelRect {
             width: layer.width(),
             height: layer.height(),
         },
-    }
+    };
+    Some(bounds)
 }
 
 pub fn fit_view(session: &mut Session, alloc_w: i32, alloc_h: i32) {

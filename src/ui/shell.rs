@@ -478,7 +478,7 @@ impl Shell {
             let Some(session) = model.session.as_mut() else {
                 return;
             };
-            if session.editor.document().active_index() == index {
+            if session.editor.document().active_index() == Some(index) {
                 return;
             }
             session.editor.set_active(index).is_ok()
@@ -502,7 +502,7 @@ impl Shell {
             .borrow()
             .session
             .as_ref()
-            .map(|session| session.editor.document().active_index())
+            .and_then(|session| session.editor.document().active_index())
     }
 
     pub fn active_opacity(&self) -> Option<f32> {
@@ -510,7 +510,8 @@ impl Shell {
             .borrow()
             .session
             .as_ref()
-            .map(|session| session.editor.document().active_layer().opacity)
+            .and_then(|session| session.editor.document().active_layer())
+            .map(|layer| layer.opacity)
     }
 
     pub fn preview_opacity(&self, opacity: f32) {
@@ -518,7 +519,9 @@ impl Shell {
         let Some(session) = model.session.as_mut() else {
             return;
         };
-        let index = session.editor.document().active_index();
+        let Some(index) = session.editor.document().active_index() else {
+            return;
+        };
         session.preview = Some(Preview::Opacity { index, opacity });
         session.visual = session.visual.wrapping_add(1);
         drop(model);
@@ -565,9 +568,13 @@ impl Shell {
             self.enable("undo", session.editor.can_undo());
             self.enable("redo", session.editor.can_redo());
             self.enable_document_actions(true);
-            let locked = doc.active_layer().locked;
+            let active = doc.active_layer();
+            for name in ["duplicate", "delete-layer", "raise", "lower"] {
+                self.enable(name, active.is_some());
+            }
+            let editable = active.is_some_and(|layer| !layer.locked);
             for name in ["rotate-layer", "flip-layer-h", "flip-layer-v"] {
-                self.enable(name, !locked);
+                self.enable(name, editable);
             }
             drop(model);
             self.fill_tool_options();
@@ -1074,11 +1081,9 @@ impl Shell {
     }
 
     fn reorder_active(self: &Rc<Self>, delta: isize) {
-        let Some((from, len)) = self.model.borrow().session.as_ref().map(|session| {
-            (
-                session.editor.document().active_index(),
-                session.editor.document().layers().len(),
-            )
+        let Some((from, len)) = self.model.borrow().session.as_ref().and_then(|session| {
+            let doc = session.editor.document();
+            Some((doc.active_index()?, doc.layers().len()))
         }) else {
             return;
         };
@@ -1200,8 +1205,10 @@ impl Shell {
 
     fn nudge(self: &Rc<Self>, dx: i32, dy: i32) {
         let Some((index, x, y)) = self.model.borrow().session.as_ref().and_then(|session| {
-            let layer = session.editor.document().active_layer();
-            (!layer.locked).then(|| (session.editor.document().active_index(), layer.x, layer.y))
+            let doc = session.editor.document();
+            let index = doc.active_index()?;
+            let layer = &doc.layers()[index];
+            (!layer.locked).then_some((index, layer.x, layer.y))
         }) else {
             return;
         };
@@ -1321,15 +1328,15 @@ impl Shell {
         let drag = match session.tool {
             Tool::Move => {
                 selected = select_under_pointer(session, x, y);
-                if session.editor.document().active_layer().locked {
+                let Some(kind) = move_drag(session, x, y) else {
                     drop(model);
                     if selected {
                         self.refresh();
                     }
                     return;
-                }
+                };
                 Drag {
-                    kind: move_drag(session, x, y),
+                    kind,
                     origin_x: x,
                     origin_y: y,
                 }
@@ -1694,25 +1701,44 @@ fn rotation_degrees(
     }
 }
 
-/// Make the layer under the pointer active, unless the pointer is on one of
-/// the active layer's handles. Returns whether the active layer changed.
+/// Make the layer under the pointer active. The active layer's handles and
+/// the rest of its box keep it selected, so a layer with transparent areas can
+/// still be grabbed. A click on nothing deselects. Returns whether the
+/// selection changed.
 fn select_under_pointer(session: &mut super::model::Session, x: f64, y: f64) -> bool {
     if hit_at(session, x, y).is_some() {
         return false;
     }
     let (dx, dy) = widget_to_doc(session, x, y);
-    match session.editor.document().layer_at(dx, dy) {
-        Some(index) if index != session.editor.document().active_index() => {
-            session.editor.set_active(index).is_ok()
+    let doc = session.editor.document();
+    let active = doc.active_index();
+    let keep = active.filter(|_| {
+        doc.active_layer().is_some_and(|layer| !layer.locked) && pointer_inside_layer(session, x, y)
+    });
+    let target = doc.layer_at(dx, dy).or(keep);
+    if target == active {
+        return false;
+    }
+    match target {
+        Some(index) => session.editor.set_active(index).is_ok(),
+        None => {
+            session.editor.deselect();
+            true
         }
-        _ => false,
     }
 }
 
-fn move_drag(session: &super::model::Session, x: f64, y: f64) -> DragKind {
-    let index = session.editor.document().active_index();
-    let bounds = active_bounds(session);
-    match hit_at(session, x, y) {
+/// The drag the move tool starts on the active layer, or `None` when nothing
+/// editable is selected.
+fn move_drag(session: &super::model::Session, x: f64, y: f64) -> Option<DragKind> {
+    let doc = session.editor.document();
+    let index = doc.active_index()?;
+    let layer = &doc.layers()[index];
+    if layer.locked {
+        return None;
+    }
+    let bounds = active_bounds(session)?;
+    let kind = match hit_at(session, x, y) {
         Some(Handle::Rotate) => {
             let cx = bounds.x as f64 + bounds.width as f64 / 2.0;
             let cy = bounds.y as f64 + bounds.height as f64 / 2.0;
@@ -1729,19 +1755,19 @@ fn move_drag(session: &super::model::Session, x: f64, y: f64) -> DragKind {
             handle,
             origin: bounds,
         },
-        None => {
-            let layer = session.editor.document().active_layer();
-            DragKind::Move {
-                index,
-                x: layer.x,
-                y: layer.y,
-            }
-        }
-    }
+        None => DragKind::Move {
+            index,
+            x: layer.x,
+            y: layer.y,
+        },
+    };
+    Some(kind)
 }
 
 fn pointer_inside_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
-    let bounds = active_bounds(session);
+    let Some(bounds) = active_bounds(session) else {
+        return false;
+    };
     let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
     let (right, bottom) = doc_to_widget(
         session,
@@ -1758,10 +1784,10 @@ fn pointer_on_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
 
 /// A locked layer has no handles, so this is `None` for one.
 fn hit_at(session: &super::model::Session, x: f64, y: f64) -> Option<Handle> {
-    if session.editor.document().active_layer().locked {
+    if session.editor.document().active_layer()?.locked {
         return None;
     }
-    let bounds = active_bounds(session);
+    let bounds = active_bounds(session)?;
     let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
     let (right, bottom) = doc_to_widget(
         session,
@@ -1782,7 +1808,12 @@ fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'sta
             Some(Handle::NorthEast | Handle::SouthWest) => "nesw-resize",
             None if session.space_down || pointer_on_layer(session, x, y) => "grab",
             None if pointer_inside_layer(session, x, y) => {
-                if session.editor.document().active_layer().locked {
+                if session
+                    .editor
+                    .document()
+                    .active_layer()
+                    .is_some_and(|layer| layer.locked)
+                {
                     "not-allowed"
                 } else {
                     "grab"

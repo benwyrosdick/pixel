@@ -110,7 +110,7 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
             pixels,
         });
     }
-    let active = manifest.active.min(layers.len() - 1);
+    let active = manifest.active.map(|index| index.min(layers.len() - 1));
     Document::from_parts(
         manifest.width,
         manifest.height,
@@ -139,7 +139,8 @@ struct Manifest {
     height: u32,
     ppi: f32,
     background: BackgroundSer,
-    active: usize,
+    /// `null` when no layer was selected.
+    active: Option<usize>,
     layers: Vec<LayerSer>,
 }
 
@@ -390,6 +391,22 @@ mod tests {
         )
         .unwrap();
         assert!(!old.locked);
+    }
+
+    #[test]
+    fn project_roundtrip_keeps_no_selection_and_reads_an_older_index() {
+        let mut editor = Editor::new(sample_doc());
+        editor.deselect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        assert_eq!(open_project(&path).unwrap().active_index(), None);
+
+        let old: Manifest = serde_json::from_str(
+            r#"{"version":1,"width":1,"height":1,"ppi":72.0,"background":{"type":"transparent"},"active":0,"layers":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.active, Some(0));
     }
 
     #[test]

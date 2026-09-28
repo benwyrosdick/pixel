@@ -140,7 +140,8 @@ pub struct Document {
     pub ppi: f32,
     pub background: Background,
     layers: Vec<Layer>,
-    active: usize,
+    /// The selected layer. `None` when nothing is selected.
+    active: Option<usize>,
     next_id: u64,
 }
 
@@ -164,7 +165,7 @@ impl Document {
             ppi: spec.ppi,
             background: spec.background,
             layers: Vec::new(),
-            active: 0,
+            active: None,
             next_id: 1,
         };
         let layer = blank_layer(&mut doc, "Layer 1");
@@ -187,7 +188,7 @@ impl Document {
             ppi,
             background: Background::Transparent,
             layers: Vec::new(),
-            active: 0,
+            active: None,
             next_id: 1,
         };
         let mut layer = blank_layer(&mut doc, "Layer 1");
@@ -200,12 +201,12 @@ impl Document {
         &self.layers
     }
 
-    pub fn active_index(&self) -> usize {
+    pub fn active_index(&self) -> Option<usize> {
         self.active
     }
 
-    pub fn active_layer(&self) -> &Layer {
-        &self.layers[self.active]
+    pub fn active_layer(&self) -> Option<&Layer> {
+        self.active.map(|index| &self.layers[index])
     }
 
     /// The topmost visible, unlocked layer with a non-transparent pixel at a
@@ -235,7 +236,7 @@ impl Document {
 
     fn insert_layer(&mut self, layer: Layer) {
         self.layers.push(layer);
-        self.active = self.layers.len() - 1;
+        self.active = Some(self.layers.len() - 1);
     }
 
     pub(crate) fn from_parts(
@@ -244,11 +245,11 @@ impl Document {
         ppi: f32,
         background: Background,
         layers: Vec<Layer>,
-        active: usize,
+        active: Option<usize>,
         next_id: u64,
     ) -> Result<Self, Error> {
         check_size(width, height)?;
-        if layers.is_empty() || active >= layers.len() {
+        if layers.is_empty() || active.is_some_and(|index| index >= layers.len()) {
             return Err(Error::BadProject);
         }
         let mut seen = std::collections::BTreeSet::new();
@@ -418,7 +419,7 @@ struct GeomSnap {
     height: u32,
     ppi: f32,
     background: Background,
-    active_id: u64,
+    active_id: Option<u64>,
     layers: Vec<GeomLayer>,
 }
 
@@ -459,8 +460,12 @@ impl Editor {
         if index >= self.doc.layers.len() {
             return Err(Error::BadLayer);
         }
-        self.doc.active = index;
+        self.doc.active = Some(index);
         Ok(())
+    }
+
+    pub fn deselect(&mut self) {
+        self.doc.active = None;
     }
 
     /// `Ok(true)` when the document changed. A valid no-op is `Ok(false)`.
@@ -516,7 +521,7 @@ fn geom_snap(doc: &Document) -> GeomSnap {
         height: doc.height,
         ppi: doc.ppi,
         background: doc.background,
-        active_id: doc.layers[doc.active].id,
+        active_id: doc.active.map(|index| doc.layers[index].id),
         layers: doc
             .layers
             .iter()
@@ -564,11 +569,9 @@ fn restore_geom(doc: &mut Document, snap: GeomSnap) {
         ordered.push(layer);
     }
     doc.layers = ordered;
-    doc.active = doc
-        .layers
-        .iter()
-        .position(|layer| layer.id == snap.active_id)
-        .unwrap_or(0);
+    doc.active = snap
+        .active_id
+        .and_then(|id| doc.layers.iter().position(|layer| layer.id == id));
 }
 
 /// `Ok(false)` means the command is valid and would not change the document.
@@ -727,11 +730,9 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
                 return Err(Error::BadLayer);
             }
             doc.layers.remove(index);
-            if doc.active > index {
-                doc.active -= 1;
-            }
-            if doc.active >= doc.layers.len() {
-                doc.active = doc.layers.len() - 1;
+            if let Some(active) = doc.active {
+                let active = if active > index { active - 1 } else { active };
+                doc.active = Some(active.min(doc.layers.len() - 1));
             }
         }
         Command::Reorder { from, to } => ops::reorder(doc, from, to)?,
@@ -1015,6 +1016,53 @@ mod tests {
         assert!(!editor.document().layers[0].locked);
         editor.redo();
         assert!(editor.document().layers[0].locked);
+    }
+
+    #[test]
+    fn deselecting_survives_layer_edits_and_a_new_layer_selects_itself() {
+        let mut editor = doc_with(2, 2, (0, 0), rgba(255, 0, 0, 255));
+        editor.apply(Command::AddLayer).unwrap();
+        editor.apply(Command::AddLayer).unwrap();
+        editor.deselect();
+        assert_eq!(editor.document().active_index(), None);
+        assert!(editor.document().active_layer().is_none());
+
+        editor.apply(Command::Reorder { from: 0, to: 2 }).unwrap();
+        editor.apply(Command::DeleteLayer { index: 1 }).unwrap();
+        assert_eq!(editor.document().active_index(), None);
+
+        editor.set_active(0).unwrap();
+        assert_eq!(editor.document().active_index(), Some(0));
+        editor.deselect();
+        editor.apply(Command::AddLayer).unwrap();
+        assert_eq!(editor.document().active_index(), Some(2));
+    }
+
+    #[test]
+    fn undo_brings_back_the_selection_the_edit_was_made_with() {
+        let mut editor = doc_with(2, 2, (0, 0), rgba(255, 0, 0, 255));
+        editor
+            .apply(Command::MoveLayer {
+                index: 0,
+                x: 1,
+                y: 0,
+            })
+            .unwrap();
+        editor.deselect();
+        editor.undo();
+        assert_eq!(editor.document().active_index(), Some(0));
+
+        editor.deselect();
+        editor
+            .apply(Command::MoveLayer {
+                index: 0,
+                x: 1,
+                y: 1,
+            })
+            .unwrap();
+        editor.set_active(0).unwrap();
+        editor.undo();
+        assert_eq!(editor.document().active_index(), None);
     }
 
     #[test]
@@ -1327,7 +1375,7 @@ mod tests {
             .iter()
             .map(|layer| layer.name.clone())
             .collect();
-        let active_id = editor.document().active_layer().id;
+        let active_id = editor.document().active_layer().unwrap().id;
         editor.apply(Command::Reorder { from: 0, to: 2 }).unwrap();
         let after: Vec<_> = editor
             .document()
@@ -1336,8 +1384,8 @@ mod tests {
             .map(|layer| layer.name.clone())
             .collect();
         assert_eq!(after[2], names[0]);
-        assert_eq!(editor.document().active_layer().id, active_id);
-        assert_ne!(editor.document().active_index(), 2);
+        assert_eq!(editor.document().active_layer().unwrap().id, active_id);
+        assert_ne!(editor.document().active_index(), Some(2));
     }
 
     #[test]

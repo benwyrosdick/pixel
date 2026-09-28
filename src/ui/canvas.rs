@@ -198,7 +198,8 @@ mod imp {
                 snapshot.append_color(&color, &graphene::Rect::new(x + w - border, y, border, h));
             }
             snapshot.restore();
-            if session.tool == Tool::Move && !doc.active_layer().locked {
+            let editable = doc.active_layer().is_some_and(|layer| !layer.locked);
+            if session.tool == Tool::Move && editable {
                 draw_handles(snapshot, session, model.accent);
             }
         }
@@ -259,7 +260,9 @@ impl Canvas {
 }
 
 fn draw_handles(snapshot: &gtk::Snapshot, session: &Session, accent: (f32, f32, f32)) {
-    let bounds = active_bounds(session);
+    let Some(bounds) = active_bounds(session) else {
+        return;
+    };
     let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
     let (right, bottom) = doc_to_widget(
         session,
