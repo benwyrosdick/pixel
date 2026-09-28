@@ -1412,7 +1412,12 @@ mod tests {
             })
             .unwrap();
         let positions = |editor: &Editor| -> Vec<(i32, i32)> {
-            editor.doc.layers.iter().map(|layer| (layer.x, layer.y)).collect()
+            editor
+                .doc
+                .layers
+                .iter()
+                .map(|layer| (layer.x, layer.y))
+                .collect()
         };
         editor
             .apply(Command::AlignLayers {

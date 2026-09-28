@@ -184,19 +184,20 @@ impl Shell {
         let redo_btn = gtk::Button::from_icon_name("edit-redo-symbolic");
         redo_btn.set_tooltip_text(Some("Redo"));
         let export_btn = gtk::Button::with_label("Export");
-        let menu_btn = gtk::MenuButton::new();
-        menu_btn.set_icon_name("open-menu-symbolic");
-        menu_btn.set_menu_model(Some(&app_menu()));
+        // A menu bar, not a menu button. Each menu drops down under its own
+        // title, so none of them slide off the edge of the window.
+        let menu_bar = gtk::PopoverMenuBar::from_model(Some(&app_menu()));
+        menu_bar.add_css_class("pixel-menubar");
 
         let header = libadwaita::HeaderBar::new();
         header.pack_start(&undo_btn);
         header.pack_start(&redo_btn);
-        header.pack_end(&menu_btn);
         header.pack_end(&export_btn);
         header.set_title_widget(Some(&title));
 
         let top = gtk::Box::new(gtk::Orientation::Vertical, 0);
         top.append(&header);
+        top.append(&menu_bar);
         top.append(&tool_options);
 
         let status_size = gtk::Label::new(None);

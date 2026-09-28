@@ -59,7 +59,7 @@ impl ThemeColors {
               background-color: {bg};
               color: {fg};
             }}
-            headerbar {{
+            headerbar, .pixel-menubar {{
               background-color: {dark};
               color: {fg};
             }}
