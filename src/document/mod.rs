@@ -281,6 +281,38 @@ impl Document {
         })
     }
 
+    /// The box around every pixel the visible layers draw on the canvas. The
+    /// canvas background doesn't count. `None` when they draw nothing.
+    pub fn content_bounds(&self) -> Option<PixelRect> {
+        let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        for layer in &self.layers {
+            if !layer.visible || layer.opacity <= 0.0 {
+                continue;
+            }
+            let (ox, oy) = (layer.x as i64, layer.y as i64);
+            let left = ox.max(0);
+            let top = oy.max(0);
+            let right = (ox + layer.width() as i64).min(self.width as i64);
+            let bottom = (oy + layer.height() as i64).min(self.height as i64);
+            for y in top..bottom {
+                for x in left..right {
+                    if layer.pixels.get_pixel((x - ox) as u32, (y - oy) as u32)[3] > 0 {
+                        x0 = x0.min(x);
+                        y0 = y0.min(y);
+                        x1 = x1.max(x + 1);
+                        y1 = y1.max(y + 1);
+                    }
+                }
+            }
+        }
+        (x0 < x1).then(|| PixelRect {
+            x: x0 as i32,
+            y: y0 as i32,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        })
+    }
+
     /// Visible layers whose drawn pixels all fall inside `area`. Only pixels on
     /// the canvas count, and a layer with none is skipped.
     pub fn layers_within(&self, area: PixelRect) -> Vec<usize> {
@@ -1297,6 +1329,36 @@ mod tests {
             vec![2],
             "the part of the square off the canvas does not count"
         );
+    }
+
+    #[test]
+    fn content_bounds_covers_visible_layers_on_the_canvas_only() {
+        let mut editor = three_layers();
+        editor
+            .apply(Command::SetVisibility {
+                index: 0,
+                visible: false,
+            })
+            .unwrap();
+        // The squares cover (1, 1) to (7, 7).
+        assert_eq!(editor.document().content_bounds(), Some(area(1, 1, 6, 6)));
+
+        editor.doc.layers[2].x = 7;
+        assert_eq!(
+            editor.document().content_bounds(),
+            Some(area(1, 1, 7, 6)),
+            "a square hanging off the right edge stops at the canvas"
+        );
+
+        for index in [1, 2] {
+            editor
+                .apply(Command::SetVisibility {
+                    index,
+                    visible: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(editor.document().content_bounds(), None);
     }
 
     #[test]

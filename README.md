@@ -46,6 +46,8 @@ The window reads `~/.local/state/omarchy/current/theme/colors.toml` and follows 
 | Duplicate layer | Ctrl+J |
 | Raise / lower layer | Ctrl+] / Ctrl+[ |
 
+Image ▸ Trim to Content crops the canvas to the pixels the visible layers draw, ignoring the canvas background. File ▸ Open Recent and the welcome screen list the files Pixel opened or saved recently.
+
 Paste or drop an image to add it as a layer, or to open it when nothing is open. Copy takes the selected layers, flattened and trimmed to what they draw, or the whole image when nothing is selected.
 
 Projects are zip files with a `.pixel` extension. Export writes PNG, JPEG, or lossless WebP and does not change the open document. JPEG is flattened onto the canvas background, or onto white when the background is transparent.

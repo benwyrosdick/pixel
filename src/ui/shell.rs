@@ -45,6 +45,13 @@ pub struct Shell {
     drag: RefCell<Option<Drag>>,
     crop_label: RefCell<Option<gtk::Label>>,
     theme_monitor: RefCell<Option<gio::FileMonitor>>,
+    /// The File ▸ Open Recent submenu, refilled when the recent list changes.
+    recent_menu: gio::Menu,
+    /// The welcome screen's recent files, and the group that holds them.
+    recent_list: gtk::ListBox,
+    recent_group: gtk::Box,
+    /// The files behind the welcome screen's rows, in row order.
+    recent_paths: RefCell<Vec<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -180,7 +187,8 @@ impl Shell {
         editor.append(&tools);
         editor.append(&split);
 
-        let (welcome, new_canvas, open_image, open_project) = welcome_page();
+        let (welcome, new_canvas, open_image, open_project, recent_group, recent_list) =
+            welcome_page();
         let stack = gtk::Stack::new();
         stack.add_named(&welcome, Some("welcome"));
         stack.add_named(&editor, Some("editor"));
@@ -193,7 +201,8 @@ impl Shell {
         let export_btn = gtk::Button::with_label("Export");
         // A menu bar, not a menu button. Each menu drops down under its own
         // title, so none of them slide off the edge of the window.
-        let menu_bar = gtk::PopoverMenuBar::from_model(Some(&app_menu()));
+        let recent_menu = gio::Menu::new();
+        let menu_bar = gtk::PopoverMenuBar::from_model(Some(&app_menu(&recent_menu)));
         menu_bar.add_css_class("pixel-menubar");
 
         let header = libadwaita::HeaderBar::new();
@@ -263,9 +272,20 @@ impl Shell {
             drag: RefCell::new(None),
             crop_label: RefCell::new(None),
             theme_monitor: RefCell::new(None),
+            recent_menu,
+            recent_list,
+            recent_group,
+            recent_paths: RefCell::new(Vec::new()),
         });
         shell.bind(&new_canvas, &open_image, &open_project, &fit, &actual);
         shell.refresh();
+        shell.refresh_recent();
+        let weak = Rc::downgrade(&shell);
+        gtk::RecentManager::default().connect_changed(move |_| {
+            if let Some(shell) = weak.upgrade() {
+                shell.refresh_recent();
+            }
+        });
         shell
     }
 
@@ -372,6 +392,24 @@ impl Shell {
         });
         self.add_action("canvas-size", &[], |shell| shell.canvas_size());
         self.add_action("image-size", &[], |shell| shell.image_size());
+        self.add_action("trim", &[], |shell| shell.trim_to_content());
+        let open_recent = gio::SimpleAction::new("open-recent", Some(glib::VariantTy::STRING));
+        let shell = self.clone();
+        open_recent.connect_activate(move |_, target| {
+            if let Some(path) = target.and_then(|target| target.str()) {
+                shell.open_path(Path::new(path));
+            }
+        });
+        self.window.add_action(&open_recent);
+        let shell = self.clone();
+        self.recent_list.connect_row_activated(move |_, row| {
+            let path = usize::try_from(row.index())
+                .ok()
+                .and_then(|index| shell.recent_paths.borrow().get(index).cloned());
+            if let Some(path) = path {
+                shell.open_path(&path);
+            }
+        });
         self.add_action("rotate-cw", &[], |shell| {
             shell.edit(Command::RotateCanvas {
                 turn: QuarterTurn::Cw,
@@ -854,6 +892,7 @@ impl Shell {
             "export",
             "close",
             "canvas-size",
+            "trim",
             "image-size",
             "rotate-cw",
             "rotate-ccw",
@@ -1050,27 +1089,17 @@ impl Shell {
 
     fn open_image(self: &Rc<Self>) {
         self.confirm(Next::Run(Box::new(move |shell| {
-            shell.pick_file(
-                "Open image",
-                image_filter(),
-                |shell, path| match open_image(&path) {
-                    Ok(doc) => shell.show_document(Editor::new(doc), None),
-                    Err(err) => shell.toast(&err.to_string()),
-                },
-            );
+            shell.pick_file("Open image", image_filter(), |shell, path| {
+                shell.load_path(&path)
+            });
         })));
     }
 
     fn open_project(self: &Rc<Self>) {
         self.confirm(Next::Run(Box::new(move |shell| {
-            shell.pick_file(
-                "Open project",
-                project_filter(),
-                |shell, path| match open_project(&path) {
-                    Ok(doc) => shell.show_document(Editor::new(doc), Some(path)),
-                    Err(err) => shell.toast(&err.to_string()),
-                },
-            );
+            shell.pick_file("Open project", project_filter(), |shell, path| {
+                shell.load_path(&path)
+            });
         })));
     }
 
@@ -1086,9 +1115,78 @@ impl Shell {
             open_image(path).map(|doc| (doc, None))
         };
         match result {
-            Ok((doc, project)) => self.show_document(Editor::new(doc), project),
+            Ok((doc, project)) => {
+                remember(path);
+                self.show_document(Editor::new(doc), project);
+            }
             Err(err) => self.toast(&err.to_string()),
         }
+    }
+
+    /// Crop the canvas to what the visible layers draw. The view shifts with
+    /// the crop so the content stays where it was on screen.
+    fn trim_to_content(self: &Rc<Self>) {
+        let (bounds, full) = {
+            let model = self.model.borrow();
+            let Some(session) = model.session.as_ref() else {
+                return;
+            };
+            let doc = session.editor.document();
+            let full = PixelRect {
+                x: 0,
+                y: 0,
+                width: doc.width,
+                height: doc.height,
+            };
+            (doc.content_bounds(), full)
+        };
+        let Some(bounds) = bounds else {
+            self.toast("There is nothing visible to trim to");
+            return;
+        };
+        if bounds == full {
+            self.toast("The canvas already fits its content");
+            return;
+        }
+        if let Some(session) = self.model.borrow_mut().session.as_mut() {
+            session.crop = None;
+            session.pan_x += bounds.x as f64 * session.zoom;
+            session.pan_y += bounds.y as f64 * session.zoom;
+        }
+        self.edit(Command::Crop {
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+        });
+    }
+
+    /// Refill the Open Recent submenu and the welcome screen's list.
+    fn refresh_recent(&self) {
+        let paths = recent_files();
+        self.recent_menu.remove_all();
+        for path in &paths {
+            let item = gio::MenuItem::new(Some(&menu_label(&display_name(path))), None);
+            item.set_action_and_target_value(
+                Some("win.open-recent"),
+                Some(&path.to_string_lossy().to_variant()),
+            );
+            self.recent_menu.append_item(&item);
+        }
+        if paths.is_empty() {
+            // No action, so GTK shows it greyed out.
+            self.recent_menu
+                .append_item(&gio::MenuItem::new(Some("No Recent Files"), None));
+        }
+        while let Some(row) = self.recent_list.row_at_index(0) {
+            self.recent_list.remove(&row);
+        }
+        let shown: Vec<PathBuf> = paths.iter().take(WELCOME_RECENT).cloned().collect();
+        for path in &shown {
+            self.recent_list.append(&recent_row(path));
+        }
+        *self.recent_paths.borrow_mut() = shown;
+        self.recent_group.set_visible(!paths.is_empty());
     }
 
     fn close_document(self: &Rc<Self>) {
@@ -1172,6 +1270,8 @@ impl Shell {
                     session.path = Some(path.to_path_buf());
                     session.dirty = false;
                 }
+                drop(model);
+                remember(path);
                 self.toast("Saved");
                 true
             }
@@ -1891,6 +1991,8 @@ fn welcome_page() -> (
     gtk::Button,
     gtk::Button,
     gtk::Button,
+    gtk::Box,
+    gtk::ListBox,
 ) {
     let page = libadwaita::StatusPage::new();
     page.set_title("Pixel");
@@ -1905,17 +2007,113 @@ fn welcome_page() -> (
     row.append(&new_canvas);
     row.append(&open_image);
     row.append(&open_project);
-    page.set_child(Some(&row));
-    (page, new_canvas, open_image, open_project)
+
+    let recent_list = gtk::ListBox::new();
+    recent_list.add_css_class("boxed-list");
+    recent_list.set_selection_mode(gtk::SelectionMode::None);
+    let heading = gtk::Label::new(Some("Recent"));
+    heading.add_css_class("heading");
+    heading.set_xalign(0.0);
+    let recent_group = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    recent_group.append(&heading);
+    recent_group.append(&recent_list);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 32);
+    content.append(&row);
+    content.append(&recent_group);
+    let clamp = libadwaita::Clamp::new();
+    clamp.set_maximum_size(480);
+    clamp.set_child(Some(&content));
+    page.set_child(Some(&clamp));
+    (
+        page,
+        new_canvas,
+        open_image,
+        open_project,
+        recent_group,
+        recent_list,
+    )
 }
 
-fn app_menu() -> gio::Menu {
+/// How many recent files the File menu lists.
+const RECENT_LIMIT: usize = 10;
+
+/// How many of them the welcome screen shows.
+const WELCOME_RECENT: usize = 6;
+
+/// Record a file Pixel opened or saved in the desktop's recent files.
+fn remember(path: &Path) {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if let Ok(uri) = glib::filename_to_uri(&path, None) {
+        gtk::RecentManager::default().add_item(&uri);
+    }
+}
+
+/// Files Pixel opened or saved that still exist, newest first.
+fn recent_files() -> Vec<PathBuf> {
+    let Some(app) = glib::application_name() else {
+        return Vec::new();
+    };
+    let mut items: Vec<_> = gtk::RecentManager::default()
+        .items()
+        .into_iter()
+        .filter(|info| info.has_application(&app) && info.exists())
+        .collect();
+    items.sort_by_key(|info| std::cmp::Reverse(info.modified().to_unix()));
+    items
+        .iter()
+        .filter_map(|info| gio::File::for_uri(&info.uri()).path())
+        .take(RECENT_LIMIT)
+        .collect()
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Menu labels treat `_` as a mnemonic marker, so double it to show one.
+fn menu_label(text: &str) -> String {
+    text.replace('_', "__")
+}
+
+/// A welcome-screen row: the file name over the folder it is in.
+fn recent_row(path: &Path) -> libadwaita::ActionRow {
+    let row = libadwaita::ActionRow::new();
+    row.set_use_markup(false);
+    row.set_title(&display_name(path));
+    let folder = path.parent().map(tilde_path).unwrap_or_default();
+    row.set_subtitle(&folder);
+    row.set_activatable(true);
+    row.set_tooltip_text(Some(&path.to_string_lossy()));
+    let icon = if is_project(path) {
+        "x-office-drawing-symbolic"
+    } else {
+        "image-x-generic-symbolic"
+    };
+    row.add_prefix(&gtk::Image::from_icon_name(icon));
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
+}
+
+/// A path with the home folder written as `~`.
+fn tilde_path(path: &Path) -> String {
+    match path.strip_prefix(glib::home_dir()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.to_string_lossy()),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
+fn app_menu(recent: &gio::Menu) -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append_submenu(Some("File"), &{
         let menu = gio::Menu::new();
         menu.append_item(&menu_item("New Canvas", "new"));
         menu.append_item(&menu_item("Open Image", "open"));
         menu.append_item(&menu_item("Open Project", "open-project"));
+        menu.append_submenu(Some("Open Recent"), recent);
         menu.append_item(&menu_item("Save", "save"));
         menu.append_item(&menu_item("Save As", "save-as"));
         menu.append_item(&menu_item("Export…", "export"));
@@ -1941,6 +2139,7 @@ fn app_menu() -> gio::Menu {
         let menu = gio::Menu::new();
         menu.append_item(&menu_item("Canvas Size…", "canvas-size"));
         menu.append_item(&menu_item("Image Size…", "image-size"));
+        menu.append_item(&menu_item("Trim to Content", "trim"));
         menu.append_item(&menu_item("Rotate 90° Clockwise", "rotate-cw"));
         menu.append_item(&menu_item("Rotate 90° Counterclockwise", "rotate-ccw"));
         menu.append_item(&menu_item("Rotate 180°", "rotate-180"));
