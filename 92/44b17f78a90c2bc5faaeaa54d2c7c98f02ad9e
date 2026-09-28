@@ -1,0 +1,20 @@
+src/ui/canvas.rs
+  h_4d9554034adb05 95-97,100-101,106,116,246-260
+src/ui/layers.rs
+  h_4d9554034adb05 24-29,46-47
+src/ui/shell.rs
+  h_4d9554034adb05 105-107,111-134,137
+src/ui/theme.rs
+  h_4d9554034adb05 88-91,100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9244b17f78a90c2bc5faaeaa54d2c7c98f02ad9e",
+  "prompts": {},
+  "humans": {
+    "h_4d9554034adb05": {
+      "author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
