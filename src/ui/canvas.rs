@@ -381,7 +381,7 @@ fn drag_button(gesture: &gtk::GestureDrag) -> u32 {
     }
 }
 
-fn upload(image: &image::RgbaImage) -> gdk::MemoryTexture {
+pub(super) fn upload(image: &image::RgbaImage) -> gdk::MemoryTexture {
     upload_raw(image.width(), image.height(), image.as_raw().to_vec())
 }
 

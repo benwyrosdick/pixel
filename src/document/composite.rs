@@ -35,6 +35,33 @@ pub fn composite_with(doc: &Document, overrides: Option<&[LayerOverride]>) -> Rg
     out
 }
 
+/// The listed layers flattened on their own, without the canvas background,
+/// and trimmed to the pixels they draw. `None` when they draw nothing on the
+/// canvas. Copying a selection uses this.
+pub fn composite_layers(doc: &Document, indices: &[usize]) -> Option<RgbaImage> {
+    let mut out = RgbaImage::new(doc.width, doc.height);
+    for (index, layer) in doc.layers.iter().enumerate() {
+        if indices.contains(&index) && layer.visible && layer.opacity > 0.0 {
+            blit_normal(&mut out, &layer.pixels, layer.x, layer.y, layer.opacity);
+        }
+    }
+    trim(&out)
+}
+
+/// `image` cut down to the box around its non-transparent pixels.
+fn trim(image: &RgbaImage) -> Option<RgbaImage> {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 0 {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+    }
+    (x0 < x1).then(|| image::imageops::crop_imm(image, x0, y0, x1 - x0, y1 - y0).to_image())
+}
+
 pub struct LayerOverride {
     pub index: usize,
     pub x: i32,

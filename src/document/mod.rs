@@ -6,7 +6,7 @@ mod handles;
 mod io;
 mod ops;
 
-pub use composite::{composite, composite_with, LayerOverride};
+pub use composite::{composite, composite_layers, composite_with, LayerOverride};
 pub use handles::{
     clockwise_delta, hit_handle, pointer_angle, resize_rect, rotate_handle_point, rotated_bounds,
     snap_angle, Handle, PixelRect, HANDLE_RADIUS, ROTATE_OFFSET,
@@ -32,7 +32,7 @@ pub enum Error {
     TooLarge,
     #[error("no such layer")]
     BadLayer,
-    #[error("the last layer can't be removed")]
+    #[error("a document needs at least one layer")]
     LastLayer,
     #[error("the crop is empty")]
     EmptyCrop,
@@ -1434,6 +1434,20 @@ mod tests {
             .unwrap());
         editor.undo();
         assert_eq!(positions(&editor), vec![(0, 0), (1, 1), (5, 5)]);
+    }
+
+    #[test]
+    fn composite_layers_flattens_only_the_listed_layers_and_trims_them() {
+        let editor = three_layers();
+        let doc = editor.document();
+        let copied = composite_layers(doc, &[1, 2]).unwrap();
+        // The squares sit at (1, 1) and (5, 5), so together they span 6×6.
+        assert_eq!(copied.dimensions(), (6, 6));
+        assert_eq!(copied.get_pixel(0, 0), &rgba(0, 0, 255, 255));
+        assert_eq!(copied.get_pixel(5, 5), &rgba(0, 0, 255, 255));
+        assert_eq!(copied.get_pixel(3, 3)[3], 0, "the background is left out");
+        assert_eq!(composite_layers(doc, &[0]).unwrap().dimensions(), (8, 8));
+        assert!(composite_layers(doc, &[]).is_none());
     }
 
     #[test]

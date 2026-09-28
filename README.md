@@ -34,9 +34,18 @@ The window reads `~/.local/state/omarchy/current/theme/colors.toml` and follows 
 | Save as | Ctrl+Shift+S |
 | Export | Ctrl+Shift+E |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
+| Cut / copy / paste | Ctrl+X / Ctrl+C / Ctrl+V |
+| Copy the whole image | Ctrl+Shift+C |
+| Zoom in / out | + / − |
 | Fit / actual size | Ctrl+0 / Ctrl+1 |
 | Select / move / crop | V / M / C |
+| Select all / deselect | Ctrl+A / Ctrl+Shift+A or Esc |
 | Add to or remove from the selection | Shift-click, or Shift-drag a box |
 | Nudge the selected layers | Arrow keys, Shift for 10 px |
+| Delete the selected layers | Delete or Backspace |
+| Duplicate layer | Ctrl+J |
+| Raise / lower layer | Ctrl+] / Ctrl+[ |
+
+Paste or drop an image to add it as a layer, or to open it when nothing is open. Copy takes the selected layers, flattened and trimmed to what they draw, or the whole image when nothing is selected.
 
 Projects are zip files with a `.pixel` extension. Export writes PNG, JPEG, or lossless WebP and does not change the open document. JPEG is flattened onto the canvas background, or onto white when the background is transparent.

@@ -1,6 +1,6 @@
 //! The editor window. Document changes go through [`Shell::edit`].
 
-use super::canvas::{Canvas, CanvasInput};
+use super::canvas::{upload, Canvas, CanvasInput};
 use super::dialogs;
 use super::layers::LayersPanel;
 use super::model::{
@@ -13,9 +13,10 @@ use gtk::{gio, glib, prelude::*};
 use image::ImageReader;
 use libadwaita::prelude::*;
 use pixel::document::{
-    clockwise_delta, export, hit_handle, open_image, open_project, pointer_angle, resize_rect,
-    save_project, snap_angle, Alignment, Axis, Command, Document, Editor, ExportFormat, Handle,
-    NewCanvas, PixelRect, QuarterTurn, ScaleFilter, HANDLE_RADIUS, ROTATE_OFFSET,
+    clockwise_delta, composite, composite_layers, export, hit_handle, open_image, open_project,
+    pointer_angle, resize_rect, save_project, snap_angle, Alignment, Axis, Command, Document,
+    Editor, ExportFormat, Handle, NewCanvas, PixelRect, QuarterTurn, ScaleFilter, HANDLE_RADIUS,
+    ROTATE_OFFSET,
 };
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -356,6 +357,16 @@ impl Shell {
             shell.window.close();
         });
         self.add_action("undo", &["<primary>z"], |shell| shell.undo());
+        self.add_action("cut", &[], |shell| shell.cut_selection());
+        self.add_action("copy", &[], |shell| {
+            shell.copy_selection();
+        });
+        self.add_action("copy-image", &[], |shell| shell.copy_image());
+        self.add_action("paste", &[], |shell| shell.paste());
+        self.add_action("select-all", &[], |shell| {
+            shell.set_selection((0..shell.layer_count()).collect())
+        });
+        self.add_action("deselect", &[], |shell| shell.set_selection(Vec::new()));
         self.add_action("redo", &["<primary><shift>z", "<primary>y"], |shell| {
             shell.redo()
         });
@@ -388,7 +399,7 @@ impl Shell {
         });
         self.add_action("add-layer", &[], |shell| shell.edit(Command::AddLayer));
         self.add_action("place", &[], |shell| shell.place_image());
-        self.add_action("duplicate", &[], |shell| {
+        self.add_action("duplicate", &["<primary>j"], |shell| {
             if let Some(index) = shell.active_index() {
                 shell.edit(Command::DuplicateLayer { index });
             }
@@ -421,13 +432,57 @@ impl Shell {
                 shell.arrange(|indices| Command::DistributeLayers { indices, axis })
             });
         }
-        self.add_action("raise", &[], |shell| shell.reorder_active(1));
-        self.add_action("lower", &[], |shell| shell.reorder_active(-1));
+        self.add_action("raise", &["<primary>bracketright"], |shell| {
+            shell.reorder_active(1)
+        });
+        self.add_action("lower", &["<primary>bracketleft"], |shell| {
+            shell.reorder_active(-1)
+        });
         self.add_action("fit", &["<primary>0"], |shell| shell.zoom_fit());
         self.add_action("actual", &["<primary>1"], |shell| shell.zoom_actual());
-        self.add_action("tool-select", &["v"], |shell| shell.set_tool(Tool::Select));
-        self.add_action("tool-move", &["m"], |shell| shell.set_tool(Tool::Move));
-        self.add_action("tool-crop", &["c"], |shell| shell.set_tool(Tool::Crop));
+        self.add_action("zoom-in", &[], |shell| shell.zoom_step(ZOOM_STEP));
+        self.add_action("zoom-out", &[], |shell| shell.zoom_step(1.0 / ZOOM_STEP));
+        self.add_action("tool-select", &[], |shell| shell.set_tool(Tool::Select));
+        self.add_action("tool-move", &[], |shell| shell.set_tool(Tool::Move));
+        self.add_action("tool-crop", &[], |shell| shell.set_tool(Tool::Crop));
+
+        // Application accelerators run before the focused widget sees a key,
+        // so a letter or Ctrl+V would never reach a layer name being edited.
+        // These run after it instead, once nothing else has used the key.
+        let shortcuts = gtk::ShortcutController::new();
+        shortcuts.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        for (action, keys) in EDITING_SHORTCUTS {
+            shortcuts.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(keys),
+                Some(gtk::NamedAction::new(&format!("win.{action}"))),
+            ));
+        }
+        self.window.add_controller(shortcuts);
+
+        let drop = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+        drop.set_types(&[gdk::FileList::static_type(), gdk::Texture::static_type()]);
+        let shell = self.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            let shell = shell.clone();
+            if let Ok(files) = value.get::<gdk::FileList>() {
+                let paths = files
+                    .files()
+                    .iter()
+                    .filter_map(|file| file.path())
+                    .collect();
+                // Opening can ask to save first, which shouldn't happen mid-drop.
+                glib::idle_add_local_once(move || shell.add_files(paths));
+                true
+            } else if let Ok(texture) = value.get::<gdk::Texture>() {
+                glib::idle_add_local_once(move || {
+                    shell.add_image("Dropped image", texture_image(&texture))
+                });
+                true
+            } else {
+                false
+            }
+        });
+        self.stack.add_controller(drop);
 
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
@@ -525,6 +580,126 @@ impl Shell {
             .unwrap_or_default();
         if !indices.is_empty() {
             self.edit(command(indices));
+        }
+    }
+
+    /// Copy the selected layers, flattened and trimmed, or the whole image
+    /// when nothing is selected. Returns whether anything was copied.
+    fn copy_selection(self: &Rc<Self>) -> bool {
+        let image = {
+            let model = self.model.borrow();
+            let Some(session) = model.session.as_ref() else {
+                return false;
+            };
+            let doc = session.editor.document();
+            let indices = doc.selected_indices();
+            if indices.is_empty() {
+                Some(composite(doc))
+            } else {
+                composite_layers(doc, &indices)
+            }
+        };
+        let Some(image) = image else {
+            self.toast("The selected layers have nothing visible to copy");
+            return false;
+        };
+        self.window.clipboard().set_texture(&upload(&image));
+        true
+    }
+
+    /// Copy the flattened image, background included, whatever is selected.
+    fn copy_image(self: &Rc<Self>) {
+        let image = self
+            .model
+            .borrow()
+            .session
+            .as_ref()
+            .map(|session| composite(session.editor.document()));
+        if let Some(image) = image {
+            self.window.clipboard().set_texture(&upload(&image));
+        }
+    }
+
+    fn cut_selection(self: &Rc<Self>) {
+        let selected = self
+            .model
+            .borrow()
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.editor.document().selected_indices().is_empty());
+        if selected && self.copy_selection() {
+            self.delete_selected();
+        }
+    }
+
+    /// Paste an image as a new layer, or copied image files as layers. With
+    /// no document open, the image opens as one.
+    fn paste(self: &Rc<Self>) {
+        let clipboard = self.window.clipboard();
+        let formats = clipboard.formats();
+        let shell = self.clone();
+        if formats.contains_type(gdk::Texture::static_type()) {
+            glib::spawn_future_local(async move {
+                match clipboard.read_texture_future().await {
+                    Ok(Some(texture)) => shell.add_image("Pasted image", texture_image(&texture)),
+                    Ok(None) => shell.toast("The clipboard has no image"),
+                    Err(err) => shell.toast(&format!("Couldn't paste: {err}")),
+                }
+            });
+        } else if formats.contains_type(gdk::FileList::static_type()) {
+            glib::spawn_future_local(async move {
+                let value = clipboard
+                    .read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT)
+                    .await;
+                match value.map(|value| value.get::<gdk::FileList>()) {
+                    Ok(Ok(files)) => {
+                        let paths = files
+                            .files()
+                            .iter()
+                            .filter_map(|file| file.path())
+                            .collect();
+                        shell.add_files(paths);
+                    }
+                    _ => shell.toast("Couldn't read the copied files"),
+                }
+            });
+        } else {
+            self.toast("The clipboard has no image");
+        }
+    }
+
+    /// Add an image as a new layer, or open it when no document is open.
+    fn add_image(self: &Rc<Self>, name: &str, image: image::RgbaImage) {
+        if self.model.borrow().session.is_some() {
+            self.edit(Command::AddImageLayer {
+                name: name.to_string(),
+                image,
+            });
+            return;
+        }
+        match Document::from_image(image, 72.0) {
+            Ok(doc) => self.show_document(Editor::new(doc), None),
+            Err(err) => self.toast(&err.to_string()),
+        }
+    }
+
+    /// Take in dropped or pasted files. A project replaces the open document.
+    /// Images become layers, except that the first opens as the document when
+    /// none is open.
+    fn add_files(self: &Rc<Self>, paths: Vec<PathBuf>) {
+        if let Some(project) = paths.iter().find(|path| is_project(path)) {
+            self.open_path(project);
+            return;
+        }
+        let mut images = paths.into_iter();
+        if self.model.borrow().session.is_none() {
+            let Some(first) = images.next() else {
+                return;
+            };
+            self.load_path(&first);
+        }
+        for path in images {
+            self.place_path(&path);
         }
     }
 
@@ -628,6 +803,7 @@ impl Shell {
                 self.enable(name, active.is_some());
             }
             self.enable("delete-layer", !doc.selected_indices().is_empty());
+            self.enable("cut", !doc.selected_indices().is_empty());
             let movable = movable_selection(doc).len();
             for (name, _) in ALIGNMENTS {
                 self.enable(name, movable >= 1);
@@ -703,6 +879,13 @@ impl Shell {
             "distribute-vertical",
             "fit",
             "actual",
+            "zoom-in",
+            "zoom-out",
+            "cut",
+            "copy",
+            "copy-image",
+            "select-all",
+            "deselect",
             "tool-select",
             "tool-move",
             "tool-crop",
@@ -897,7 +1080,7 @@ impl Shell {
     }
 
     fn load_path(self: &Rc<Self>, path: &Path) {
-        let result = if path.extension().and_then(|ext| ext.to_str()) == Some("pixel") {
+        let result = if is_project(path) {
             open_project(path).map(|doc| (doc, Some(path.to_path_buf())))
         } else {
             open_image(path).map(|doc| (doc, None))
@@ -1059,23 +1242,28 @@ impl Shell {
 
     fn place_image(self: &Rc<Self>) {
         self.pick_file("Add image as layer", image_filter(), |shell, path| {
-            let image = match ImageReader::open(&path)
-                .map_err(|err| err.to_string())
-                .and_then(|reader| reader.decode().map_err(|err| err.to_string()))
-            {
-                Ok(image) => image.into_rgba8(),
-                Err(err) => {
-                    shell.toast(&err);
-                    return;
-                }
-            };
-            let name = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("Image")
-                .to_string();
-            shell.edit(Command::AddImageLayer { name, image });
+            shell.place_path(&path)
         });
+    }
+
+    /// Add an image file as a new layer named after the file.
+    fn place_path(self: &Rc<Self>, path: &Path) {
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Image")
+            .to_string();
+        let image = match ImageReader::open(path)
+            .map_err(|err| err.to_string())
+            .and_then(|reader| reader.decode().map_err(|err| err.to_string()))
+        {
+            Ok(image) => image.into_rgba8(),
+            Err(err) => {
+                self.toast(&format!("Couldn't open {name}: {err}"));
+                return;
+            }
+        };
+        self.edit(Command::AddImageLayer { name, image });
     }
 
     fn pick_file(
@@ -1268,7 +1456,19 @@ impl Shell {
             gdk::Key::Right => self.nudge(step, 0),
             gdk::Key::Up => self.nudge(0, -step),
             gdk::Key::Down => self.nudge(0, step),
-            gdk::Key::Escape => self.cancel_crop(),
+            gdk::Key::Escape => {
+                let cropping = self
+                    .model
+                    .borrow()
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.crop.is_some());
+                if cropping {
+                    self.cancel_crop();
+                } else {
+                    self.set_selection(Vec::new());
+                }
+            }
             gdk::Key::space => {
                 if let Some(session) = self.model.borrow_mut().session.as_mut() {
                     session.space_down = true;
@@ -1361,12 +1561,22 @@ impl Shell {
     }
 
     fn zoom_wheel(&self, x: f64, y: f64, dy: f64) {
+        self.zoom_at(x, y, if dy > 0.0 { 1.0 / 1.1 } else { 1.1 });
+    }
+
+    /// Zoom about the middle of the canvas.
+    fn zoom_step(&self, factor: f64) {
+        let (x, y) = (self.canvas.width() as f64, self.canvas.height() as f64);
+        self.zoom_at(x / 2.0, y / 2.0, factor);
+    }
+
+    /// Zoom by `factor`, keeping the document point under `(x, y)` in place.
+    fn zoom_at(&self, x: f64, y: f64, factor: f64) {
         let label = {
             let mut model = self.model.borrow_mut();
             let Some(session) = model.session.as_mut() else {
                 return;
             };
-            let factor = if dy > 0.0 { 1.0 / 1.1 } else { 1.1 };
             let (cx, cy) = widget_to_doc(session, x, y);
             session.zoom = (session.zoom * factor).clamp(0.05, 32.0);
             session.pan_x = x - cx * session.zoom;
@@ -1685,7 +1895,7 @@ fn welcome_page() -> (
     let page = libadwaita::StatusPage::new();
     page.set_title("Pixel");
     page.set_description(Some(
-        "Set up a canvas, stack layers, and export a flat image.",
+        "Set up a canvas, stack layers, and export a flat image. Drop or paste an image to start.",
     ));
     let new_canvas = gtk::Button::with_label("New canvas");
     let open_image = gtk::Button::with_label("Open image");
@@ -1703,48 +1913,62 @@ fn app_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append_submenu(Some("File"), &{
         let menu = gio::Menu::new();
-        menu.append(Some("New Canvas"), Some("win.new"));
-        menu.append(Some("Open Image"), Some("win.open"));
-        menu.append(Some("Open Project"), Some("win.open-project"));
-        menu.append(Some("Save"), Some("win.save"));
-        menu.append(Some("Save As"), Some("win.save-as"));
-        menu.append(Some("Export…"), Some("win.export"));
-        menu.append(Some("Close"), Some("win.close"));
-        menu.append(Some("Quit"), Some("win.quit"));
+        menu.append_item(&menu_item("New Canvas", "new"));
+        menu.append_item(&menu_item("Open Image", "open"));
+        menu.append_item(&menu_item("Open Project", "open-project"));
+        menu.append_item(&menu_item("Save", "save"));
+        menu.append_item(&menu_item("Save As", "save-as"));
+        menu.append_item(&menu_item("Export…", "export"));
+        menu.append_item(&menu_item("Close", "close"));
+        menu.append_item(&menu_item("Quit", "quit"));
         menu
     });
     menu.append_submenu(Some("Edit"), &{
         let menu = gio::Menu::new();
-        menu.append(Some("Undo"), Some("win.undo"));
-        menu.append(Some("Redo"), Some("win.redo"));
+        menu.append_item(&menu_item("Undo", "undo"));
+        menu.append_item(&menu_item("Redo", "redo"));
+        menu.append_section(None, &{
+            let menu = gio::Menu::new();
+            menu.append_item(&menu_item("Cut", "cut"));
+            menu.append_item(&menu_item("Copy", "copy"));
+            menu.append_item(&menu_item("Copy Image", "copy-image"));
+            menu.append_item(&menu_item("Paste", "paste"));
+            menu
+        });
         menu
     });
     menu.append_submenu(Some("Image"), &{
         let menu = gio::Menu::new();
-        menu.append(Some("Canvas Size…"), Some("win.canvas-size"));
-        menu.append(Some("Image Size…"), Some("win.image-size"));
-        menu.append(Some("Rotate 90° Clockwise"), Some("win.rotate-cw"));
-        menu.append(Some("Rotate 90° Counterclockwise"), Some("win.rotate-ccw"));
-        menu.append(Some("Rotate 180°"), Some("win.rotate-180"));
-        menu.append(Some("Flip Horizontal"), Some("win.flip-h"));
-        menu.append(Some("Flip Vertical"), Some("win.flip-v"));
+        menu.append_item(&menu_item("Canvas Size…", "canvas-size"));
+        menu.append_item(&menu_item("Image Size…", "image-size"));
+        menu.append_item(&menu_item("Rotate 90° Clockwise", "rotate-cw"));
+        menu.append_item(&menu_item("Rotate 90° Counterclockwise", "rotate-ccw"));
+        menu.append_item(&menu_item("Rotate 180°", "rotate-180"));
+        menu.append_item(&menu_item("Flip Horizontal", "flip-h"));
+        menu.append_item(&menu_item("Flip Vertical", "flip-v"));
         menu
     });
     menu.append_submenu(Some("Layer"), &{
         let menu = gio::Menu::new();
-        menu.append(Some("Add Layer"), Some("win.add-layer"));
-        menu.append(Some("Add Image as Layer…"), Some("win.place"));
-        menu.append(Some("Duplicate"), Some("win.duplicate"));
-        menu.append(Some("Delete"), Some("win.delete-layer"));
-        menu.append(Some("Rotate…"), Some("win.rotate-layer"));
-        menu.append(Some("Flip Horizontal"), Some("win.flip-layer-h"));
-        menu.append(Some("Flip Vertical"), Some("win.flip-layer-v"));
-        menu.append(Some("Raise"), Some("win.raise"));
-        menu.append(Some("Lower"), Some("win.lower"));
+        menu.append_item(&menu_item("Add Layer", "add-layer"));
+        menu.append_item(&menu_item("Add Image as Layer…", "place"));
+        menu.append_item(&menu_item("Duplicate", "duplicate"));
+        menu.append_item(&menu_item("Delete", "delete-layer"));
+        menu.append_item(&menu_item("Rotate…", "rotate-layer"));
+        menu.append_item(&menu_item("Flip Horizontal", "flip-layer-h"));
+        menu.append_item(&menu_item("Flip Vertical", "flip-layer-v"));
+        menu.append_item(&menu_item("Raise", "raise"));
+        menu.append_item(&menu_item("Lower", "lower"));
         menu
     });
     menu.append_submenu(Some("Selection"), &{
         let menu = gio::Menu::new();
+        menu.append_section(None, &{
+            let menu = gio::Menu::new();
+            menu.append_item(&menu_item("Select All", "select-all"));
+            menu.append_item(&menu_item("Deselect", "deselect"));
+            menu
+        });
         menu.append_item(&icon_row(
             "Align",
             &[
@@ -1767,14 +1991,66 @@ fn app_menu() -> gio::Menu {
     });
     menu.append_submenu(Some("View"), &{
         let menu = gio::Menu::new();
-        menu.append(Some("Fit"), Some("win.fit"));
-        menu.append(Some("Actual Size"), Some("win.actual"));
-        menu.append(Some("Select Tool"), Some("win.tool-select"));
-        menu.append(Some("Move Tool"), Some("win.tool-move"));
-        menu.append(Some("Crop Tool"), Some("win.tool-crop"));
+        menu.append_item(&menu_item("Zoom In", "zoom-in"));
+        menu.append_item(&menu_item("Zoom Out", "zoom-out"));
+        menu.append_item(&menu_item("Fit", "fit"));
+        menu.append_item(&menu_item("Actual Size", "actual"));
+        menu.append_item(&menu_item("Select Tool", "tool-select"));
+        menu.append_item(&menu_item("Move Tool", "tool-move"));
+        menu.append_item(&menu_item("Crop Tool", "tool-crop"));
         menu
     });
     menu
+}
+
+/// Shortcuts that must not beat a focused text field to the key: single keys,
+/// and the clipboard and selection keys a text field uses too. The first
+/// alternative is the one menus show.
+const EDITING_SHORTCUTS: [(&str, &str); 12] = [
+    ("tool-select", "v"),
+    ("tool-move", "m"),
+    ("tool-crop", "c"),
+    ("cut", "<Control>x"),
+    ("copy", "<Control>c"),
+    ("copy-image", "<Control><Shift>c"),
+    ("paste", "<Control>v"),
+    ("select-all", "<Control>a"),
+    ("deselect", "<Control><Shift>a"),
+    ("delete-layer", "Delete|BackSpace"),
+    ("zoom-in", "plus|equal|KP_Add|<Control>plus|<Control>equal"),
+    ("zoom-out", "minus|KP_Subtract|<Control>minus"),
+];
+
+/// How much one zoom in or out step scales the view.
+const ZOOM_STEP: f64 = 1.25;
+
+/// A menu item for a window action. Items for [`EDITING_SHORTCUTS`] show the
+/// shortcut themselves, since menus only know application accelerators.
+fn menu_item(label: &str, action: &str) -> gio::MenuItem {
+    let item = gio::MenuItem::new(Some(label), Some(&format!("win.{action}")));
+    if let Some((_, keys)) = EDITING_SHORTCUTS.iter().find(|(name, _)| *name == action) {
+        let shown = keys.split('|').next().unwrap_or(keys);
+        item.set_attribute_value("accel", Some(&shown.to_variant()));
+    }
+    item
+}
+
+fn is_project(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("pixel")
+}
+
+/// A texture's pixels as straight RGBA.
+fn texture_image(texture: &gdk::Texture) -> image::RgbaImage {
+    let mut downloader = gdk::TextureDownloader::new(texture);
+    downloader.set_format(gdk::MemoryFormat::R8g8b8a8);
+    let (bytes, stride) = downloader.download_bytes();
+    let (width, height) = (texture.width() as u32, texture.height() as u32);
+    let row = width as usize * 4;
+    let mut pixels = Vec::with_capacity(row * height as usize);
+    for y in 0..height as usize {
+        pixels.extend_from_slice(&bytes[y * stride..y * stride + row]);
+    }
+    image::RgbaImage::from_raw(width, height, pixels).expect("each row is width × 4 bytes")
 }
 
 /// Align actions. A single layer aligns to the canvas.
@@ -2106,4 +2382,17 @@ fn project_filter() -> gtk::FileFilter {
 
 fn dialog_cancelled(err: &glib::Error) -> bool {
     err.matches(gtk::DialogError::Dismissed) || err.matches(gtk::DialogError::Cancelled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_image_survives_the_trip_through_a_texture() {
+        let mut image = image::RgbaImage::new(3, 2);
+        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        image.put_pixel(2, 1, image::Rgba([10, 200, 30, 128]));
+        assert_eq!(texture_image(upload(&image).upcast_ref()), image);
+    }
 }
