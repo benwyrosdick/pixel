@@ -1,0 +1,14 @@
+assets/pixel.svg
+  h_4d9554034adb05 3-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ff8bee906f891c146b7d73fbf4e6d9a90311229a",
+  "prompts": {},
+  "humans": {
+    "h_4d9554034adb05": {
+      "author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
