@@ -1,7 +1,7 @@
 //! Open images, save the layered project, and export a flattened file.
 
 use super::composite::composite;
-use super::{Background, BlendMode, Document, Error, Guides, Layer};
+use super::{Background, BlendMode, Document, Error, Guides, Layer, LayerKind};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::{ImageEncoder, ImageReader, RgbaImage};
@@ -108,6 +108,8 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
             x: layer.x,
             y: layer.y,
             pixels,
+            kind: layer.kind.clone(),
+            parent: layer.parent,
         });
     }
     let last = layers.len() - 1;
@@ -178,6 +180,12 @@ struct LayerSer {
     x: i32,
     y: i32,
     file: String,
+    /// Missing from projects saved before text and shape layers.
+    #[serde(default)]
+    kind: LayerKind,
+    /// The id of the layer's group. Missing from projects saved before groups.
+    #[serde(default)]
+    parent: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -224,6 +232,8 @@ impl Manifest {
                     x: layer.x,
                     y: layer.y,
                     file: format!("layer-{index:03}.png"),
+                    kind: layer.kind.clone(),
+                    parent: layer.parent,
                 })
                 .collect(),
         }
@@ -460,6 +470,114 @@ mod tests {
             open_project(&path).unwrap().layers()[0].blend,
             BlendMode::SoftLight
         );
+    }
+
+    #[test]
+    fn project_roundtrip_keeps_text_editable() {
+        let mut editor = Editor::new(sample_doc());
+        let spec = crate::document::TextSpec {
+            text: "Note".into(),
+            font: "Sans Bold".into(),
+            size: 12.0,
+            color: [0, 0, 0, 255],
+            align: crate::document::TextAlign::Center,
+        };
+        editor
+            .apply(Command::AddText {
+                spec: spec.clone(),
+                x: 1,
+                y: 1,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        let opened = open_project(&path).unwrap();
+        assert_eq!(opened.layers()[1].kind, editor.document().layers()[1].kind);
+        assert!(
+            matches!(&opened.layers()[1].kind, LayerKind::Text { spec: saved, .. } if *saved == spec)
+        );
+    }
+
+    /// Writes a project with a group, text, and shapes to
+    /// `PIXEL_SAMPLE_PROJECT` when set, for trying the app by hand.
+    #[test]
+    fn write_sample_project_when_asked() {
+        let Ok(path) = std::env::var("PIXEL_SAMPLE_PROJECT") else {
+            return;
+        };
+        use crate::document::{NewCanvas, ShapeKind, ShapeSpec, TextAlign, TextSpec};
+        let mut editor = Editor::new(
+            Document::new(NewCanvas {
+                width: 800,
+                height: 500,
+                ppi: 72.0,
+                background: Background::Solid([240, 240, 245, 255]),
+            })
+            .unwrap(),
+        );
+        let red = [229, 72, 77, 255];
+        editor
+            .apply(Command::AddShape {
+                spec: ShapeSpec {
+                    kind: ShapeKind::Rectangle,
+                    dx: 300.0,
+                    dy: 160.0,
+                    stroke: red,
+                    stroke_width: 4.0,
+                    fill: Some([229, 72, 77, 40]),
+                },
+                x: 80,
+                y: 80,
+            })
+            .unwrap();
+        editor
+            .apply(Command::AddShape {
+                spec: ShapeSpec {
+                    kind: ShapeKind::Arrow,
+                    dx: 180.0,
+                    dy: -90.0,
+                    stroke: red,
+                    stroke_width: 5.0,
+                    fill: None,
+                },
+                x: 420,
+                y: 200,
+            })
+            .unwrap();
+        editor
+            .apply(Command::AddText {
+                spec: TextSpec {
+                    text: "Look here".into(),
+                    font: "Sans Bold".into(),
+                    size: 40.0,
+                    color: red,
+                    align: TextAlign::Left,
+                },
+                x: 440,
+                y: 320,
+            })
+            .unwrap();
+        editor
+            .apply(Command::Group {
+                indices: vec![2, 3],
+            })
+            .unwrap();
+        save_project(editor.document(), Path::new(&path)).unwrap();
+    }
+
+    #[test]
+    fn project_roundtrip_keeps_groups() {
+        let mut editor = Editor::new(sample_doc());
+        editor.apply(Command::AddLayer).unwrap();
+        editor.apply(Command::Group { indices: vec![1] }).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        let opened = open_project(&path).unwrap();
+        assert!(opened.is_group(2));
+        assert_eq!(opened.parent_index(1), Some(2));
+        assert_eq!(opened.block(2), 1..3);
     }
 
     #[test]

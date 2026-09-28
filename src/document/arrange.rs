@@ -16,7 +16,7 @@ fn movable(doc: &Document, indices: &[usize]) -> Result<Vec<(usize, PixelRect)>,
         if layer.locked {
             continue;
         }
-        if let Some(bounds) = layer.content_bounds() {
+        if let Some(bounds) = doc.item_bounds(index) {
             items.push((index, bounds));
         }
     }

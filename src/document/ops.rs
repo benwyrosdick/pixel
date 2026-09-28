@@ -1,22 +1,10 @@
 //! Geometry and pixel transforms. Each function mutates the document in place.
 //! Callers snapshot the document for undo before calling.
 
-use super::{Anchor, Axis, Document, Error, Guides, QuarterTurn};
+use super::{Anchor, Axis, Document, Error, Guides, LayerKind, QuarterTurn};
 use image::imageops::{self, FilterType};
 use image::{Rgba, RgbaImage};
 use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
-
-pub fn reorder(doc: &mut Document, from: usize, to: usize) -> Result<(), Error> {
-    if from >= doc.layers.len() || to >= doc.layers.len() {
-        return Err(Error::BadLayer);
-    }
-    if from == to {
-        return Ok(());
-    }
-    let layer = doc.layers.remove(from);
-    doc.layers.insert(to, layer);
-    Ok(())
-}
 
 pub fn crop(doc: &mut Document, x: i32, y: i32, width: u32, height: u32) -> Result<(), Error> {
     if width == 0 || height == 0 {
@@ -30,6 +18,16 @@ pub fn crop(doc: &mut Document, x: i32, y: i32, width: u32, height: u32) -> Resu
         return Err(Error::EmptyCrop);
     }
     for layer in &mut doc.layers {
+        // Text and shapes stay whole, so they can still be edited. Groups
+        // draw nothing of their own.
+        if matches!(layer.kind, LayerKind::Group { .. }) {
+            continue;
+        }
+        if layer.is_vector() {
+            layer.x -= x0;
+            layer.y -= y0;
+            continue;
+        }
         let lx = layer.x;
         let ly = layer.y;
         let lw = layer.pixels.width() as i32;
@@ -137,6 +135,26 @@ pub fn scale_document(
     let sx = width as f64 / doc.width as f64;
     let sy = height as f64 / doc.height as f64;
     for layer in &mut doc.layers {
+        if let Some((ax, ay)) = layer.anchor() {
+            match &mut layer.kind {
+                LayerKind::Text { spec, .. } => spec.size *= sy as f32,
+                LayerKind::Shape { spec, .. } => {
+                    spec.dx *= sx as f32;
+                    spec.dy *= sy as f32;
+                    spec.stroke_width *= ((sx + sy) / 2.0) as f32;
+                }
+                LayerKind::Raster | LayerKind::Group { .. } => {}
+            }
+            let anchor = (
+                (ax as f64 * sx).round() as i32,
+                (ay as f64 * sy).round() as i32,
+            );
+            layer.redraw(anchor);
+            continue;
+        }
+        if matches!(layer.kind, LayerKind::Group { .. }) {
+            continue;
+        }
         let new_w = ((layer.pixels.width() as f64) * sx).round().max(1.0) as u32;
         let new_h = ((layer.pixels.height() as f64) * sy).round().max(1.0) as u32;
         layer.pixels = imageops::resize(&layer.pixels, new_w, new_h, filter);
@@ -167,6 +185,25 @@ pub fn scale_layer(
         return Err(Error::ZeroSize);
     }
     let layer = doc.layers.get_mut(index).ok_or(Error::BadLayer)?;
+    if layer.is_vector() {
+        // Redraw at the new size instead of stretching the pixels. Text grows
+        // with the height, and a shape's box takes the new size less its
+        // margin for the stroke.
+        let ratio = height as f32 / layer.height() as f32;
+        match &mut layer.kind {
+            LayerKind::Text { spec, .. } => spec.size = (spec.size * ratio).max(1.0),
+            LayerKind::Shape { spec, origin } => {
+                let inner = |outer: u32, pad: i32| (outer as f32 - 2.0 * pad as f32).max(1.0);
+                spec.dx = inner(width, origin.0).copysign(spec.dx);
+                spec.dy = inner(height, origin.1).copysign(spec.dy);
+            }
+            LayerKind::Raster | LayerKind::Group { .. } => {}
+        }
+        layer.redraw((0, 0));
+        layer.x = x;
+        layer.y = y;
+        return Ok(());
+    }
     layer.pixels = imageops::resize(&layer.pixels, width, height, filter);
     layer.x = x;
     layer.y = y;
@@ -176,6 +213,7 @@ pub fn scale_layer(
 pub fn rotate_canvas(doc: &mut Document, turn: QuarterTurn) {
     let (width, height) = (doc.width, doc.height);
     for layer in &mut doc.layers {
+        layer.rasterize();
         let (x, y, w, h) = (layer.x, layer.y, layer.width(), layer.height());
         let (pixels, nx, ny) = match turn {
             QuarterTurn::Cw => {
@@ -229,6 +267,7 @@ pub fn rotate_canvas(doc: &mut Document, turn: QuarterTurn) {
 pub fn flip_canvas(doc: &mut Document, axis: Axis) {
     let (width, height) = (doc.width, doc.height);
     for layer in &mut doc.layers {
+        layer.rasterize();
         let (x, y, w, h) = (
             layer.x,
             layer.y,

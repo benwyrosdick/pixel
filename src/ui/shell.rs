@@ -5,7 +5,7 @@ use super::dialogs;
 use super::layers::LayersPanel;
 use super::model::{
     active_bounds, doc_to_widget, document_title, fit_view, jpeg_needs_white, layer_bounds,
-    widget_to_doc, CropDraft, GuideDraft, Model, Preview, SnapLine, Tool,
+    widget_to_doc, CropDraft, GuideDraft, Model, Preview, ShapeDraft, ShapeStyle, SnapLine, Tool,
 };
 use super::snap::{moving_bounds, snap_lines, x_lines, y_lines, SnapTargets, SNAP_DISTANCE};
 use super::theme::{self, ThemeColors};
@@ -16,8 +16,9 @@ use libadwaita::prelude::*;
 use pixel::document::{
     adjust, clockwise_delta, composite, composite_layers, export, hit_handle, open_image,
     open_project, pointer_angle, resize_rect, save_project, snap_angle, Adjustment, Alignment,
-    Axis, BlendMode, Command, Document, Editor, ExportFormat, Guides, Handle, NewCanvas, PixelRect,
-    QuarterTurn, ScaleFilter, HANDLE_RADIUS, ROTATE_OFFSET,
+    Axis, BlendMode, Command, Document, Editor, ExportFormat, Guides, Handle, LayerKind, NewCanvas,
+    PixelRect, QuarterTurn, ScaleFilter, ShapeKind, TextAlign, TextSpec, HANDLE_RADIUS,
+    ROTATE_OFFSET,
 };
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -38,6 +39,8 @@ pub struct Shell {
     select_tool: gtk::ToggleButton,
     move_tool: gtk::ToggleButton,
     crop_tool: gtk::ToggleButton,
+    text_tool: gtk::ToggleButton,
+    shape_tool: gtk::ToggleButton,
     undo_btn: gtk::Button,
     redo_btn: gtk::Button,
     export_btn: gtk::Button,
@@ -76,6 +79,12 @@ enum DragKind {
         indices: Vec<usize>,
         /// What the moving layers draw, where the drag began.
         bounds: Option<PixelRect>,
+        targets: SnapTargets,
+    },
+    /// A shape being drawn from the point `(ax, ay)`.
+    Shape {
+        ax: f64,
+        ay: f64,
         targets: SnapTargets,
     },
     /// A guide dragged out of a ruler, or an existing one being moved.
@@ -144,6 +153,19 @@ impl Shell {
             show_rulers: true,
             show_guides: true,
             snap: true,
+            shape_style: ShapeStyle {
+                kind: ShapeKind::Arrow,
+                stroke: ANNOTATION_RED,
+                stroke_width: 4.0,
+                fill: None,
+            },
+            text_style: TextSpec {
+                text: String::new(),
+                font: "Sans Bold".into(),
+                size: 32.0,
+                color: ANNOTATION_RED,
+                align: TextAlign::Left,
+            },
         }));
 
         let canvas = Canvas::new();
@@ -153,8 +175,11 @@ impl Shell {
         let select_tool = tool_button("Select", "select", "V");
         let move_tool = tool_button("Move", "move", "M");
         let crop_tool = tool_button("Crop", "crop", "C");
-        move_tool.set_group(Some(&select_tool));
-        crop_tool.set_group(Some(&select_tool));
+        let text_tool = tool_button("Text", "text", "T");
+        let shape_tool = tool_button("Shape", "shape", "U");
+        for tool in [&move_tool, &crop_tool, &text_tool, &shape_tool] {
+            tool.set_group(Some(&select_tool));
+        }
         select_tool.set_active(true);
         let tools = gtk::Box::new(gtk::Orientation::Vertical, 0);
         tools.add_css_class("pixel-panel");
@@ -165,6 +190,8 @@ impl Shell {
         tools.append(&select_tool);
         tools.append(&move_tool);
         tools.append(&crop_tool);
+        tools.append(&text_tool);
+        tools.append(&shape_tool);
 
         let tool_options = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         tool_options.add_css_class("pixel-toolbar");
@@ -284,6 +311,8 @@ impl Shell {
             select_tool,
             move_tool,
             crop_tool,
+            text_tool,
+            shape_tool,
             undo_btn,
             redo_btn,
             export_btn,
@@ -359,12 +388,18 @@ impl Shell {
                 shell.set_tool(Tool::Move);
             }
         });
-        let shell = self.clone();
-        self.crop_tool.connect_toggled(move |button| {
-            if button.is_active() {
-                shell.set_tool(Tool::Crop);
-            }
-        });
+        for (button, tool) in [
+            (&self.crop_tool, Tool::Crop),
+            (&self.text_tool, Tool::Text),
+            (&self.shape_tool, Tool::Shape),
+        ] {
+            let shell = self.clone();
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    shell.set_tool(tool);
+                }
+            });
+        }
 
         let shell = self.clone();
         self.undo_btn.connect_clicked(move |_| shell.undo());
@@ -495,6 +530,17 @@ impl Shell {
                 shell.arrange(|indices| Command::DistributeLayers { indices, axis })
             });
         }
+        self.add_action("group", &["<primary>g"], |shell| {
+            let indices = shell.selected();
+            if !indices.is_empty() {
+                shell.edit(Command::Group { indices });
+            }
+        });
+        self.add_action("ungroup", &["<primary><shift>g"], |shell| {
+            if let Some(index) = shell.active_index() {
+                shell.edit(Command::Ungroup { index });
+            }
+        });
         self.add_action("raise", &["<primary>bracketright"], |shell| {
             shell.reorder_active(1)
         });
@@ -522,6 +568,18 @@ impl Shell {
         self.add_action("tool-select", &[], |shell| shell.set_tool(Tool::Select));
         self.add_action("tool-move", &[], |shell| shell.set_tool(Tool::Move));
         self.add_action("tool-crop", &[], |shell| shell.set_tool(Tool::Crop));
+        self.add_action("tool-text", &[], |shell| shell.set_tool(Tool::Text));
+        self.add_action("tool-shape", &[], |shell| shell.set_tool(Tool::Shape));
+        self.add_action("edit-text", &[], |shell| {
+            if let Some(index) = shell.active_index() {
+                shell.edit_text(index);
+            }
+        });
+        self.add_action("rasterize", &[], |shell| {
+            if let Some(index) = shell.active_index() {
+                shell.edit(Command::Rasterize { index });
+            }
+        });
 
         // Application accelerators run before the focused widget sees a key,
         // so a letter or Ctrl+V would never reach a layer name being edited.
@@ -701,6 +759,9 @@ impl Shell {
     pub fn active_geometry(&self) -> Option<PixelRect> {
         let model = self.model.borrow();
         let layer = model.session.as_ref()?.editor.document().active_layer()?;
+        if matches!(layer.kind, LayerKind::Group { .. }) {
+            return None;
+        }
         Some(PixelRect {
             x: layer.x,
             y: layer.y,
@@ -802,6 +863,167 @@ impl Shell {
             }
         }
         self.canvas.queue_draw();
+    }
+
+    /// A Text tool click: change the text layer under the pointer, or add text
+    /// with its top-left corner there.
+    fn text_at(self: &Rc<Self>, x: f64, y: f64) {
+        let (hit, style) = {
+            let model = self.model.borrow();
+            let Some(session) = model.session.as_ref() else {
+                return;
+            };
+            let doc = session.editor.document();
+            let hit = doc.layer_at(x, y).filter(|&index| {
+                let layer = &doc.layers()[index];
+                !layer.locked && matches!(layer.kind, LayerKind::Text { .. })
+            });
+            (hit, model.text_style.clone())
+        };
+        if let Some(index) = hit {
+            self.set_selection(vec![index]);
+            self.edit_text(index);
+            return;
+        }
+        let shell = self.clone();
+        dialogs::text(&self.window, "Add text", "Add", &style, move |spec| {
+            shell.remember_text_style(&spec);
+            if spec.text.trim().is_empty() {
+                return;
+            }
+            shell.edit(Command::AddText {
+                spec,
+                x: x.round() as i32,
+                y: y.round() as i32,
+            });
+        });
+    }
+
+    fn edit_text(self: &Rc<Self>, index: usize) {
+        let spec = {
+            let model = self.model.borrow();
+            let layer = model
+                .session
+                .as_ref()
+                .and_then(|session| session.editor.document().layers().get(index));
+            match layer.map(|layer| &layer.kind) {
+                Some(LayerKind::Text { spec, .. }) => spec.clone(),
+                _ => return,
+            }
+        };
+        let shell = self.clone();
+        dialogs::text(&self.window, "Edit text", "Apply", &spec, move |spec| {
+            shell.remember_text_style(&spec);
+            shell.edit(Command::SetText { index, spec });
+        });
+    }
+
+    /// New text starts in the style last used.
+    fn remember_text_style(&self, spec: &TextSpec) {
+        self.model.borrow_mut().text_style = TextSpec {
+            text: String::new(),
+            ..spec.clone()
+        };
+    }
+
+    /// The Shape tool's options: the kind, stroke color and width, and fill.
+    fn fill_shape_options(self: &Rc<Self>, style: ShapeStyle) {
+        let kinds = [
+            ShapeKind::Rectangle,
+            ShapeKind::Ellipse,
+            ShapeKind::Line,
+            ShapeKind::Arrow,
+        ];
+        let kind = gtk::DropDown::from_strings(&["Rectangle", "Ellipse", "Line", "Arrow"]);
+        kind.set_selected(kinds.iter().position(|&k| k == style.kind).unwrap_or(0) as u32);
+        let stroke = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+        stroke.set_rgba(&dialogs::rgba_color(style.stroke));
+        stroke.set_tooltip_text(Some("Stroke color"));
+        let width = gtk::SpinButton::with_range(0.0, 200.0, 1.0);
+        width.set_digits(0);
+        width.set_value(style.stroke_width as f64);
+        width.set_tooltip_text(Some("Stroke width, in pixels"));
+        let fill_on = gtk::CheckButton::with_label("Fill");
+        fill_on.set_active(style.fill.is_some());
+        let fill = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+        let [r, g, b, _] = style.stroke;
+        fill.set_rgba(&dialogs::rgba_color(style.fill.unwrap_or([r, g, b, 64])));
+        fill.set_tooltip_text(Some("Fill color, for rectangles and ellipses"));
+        fill.set_sensitive(style.fill.is_some());
+
+        let read: Rc<dyn Fn() -> ShapeStyle> = Rc::new({
+            let (kind, stroke, width, fill_on, fill) = (
+                kind.clone(),
+                stroke.clone(),
+                width.clone(),
+                fill_on.clone(),
+                fill.clone(),
+            );
+            move || ShapeStyle {
+                kind: kinds[kind.selected() as usize % kinds.len()],
+                stroke: dialogs::rgba_bytes(stroke.rgba()),
+                stroke_width: width.value() as f32,
+                fill: fill_on
+                    .is_active()
+                    .then(|| dialogs::rgba_bytes(fill.rgba())),
+            }
+        });
+        // Restyling rebuilds these controls, so wait until each signal is done.
+        let changed = {
+            let shell = self.clone();
+            let read = read.clone();
+            move || {
+                let shell = shell.clone();
+                let style = read();
+                glib::idle_add_local_once(move || shell.set_shape_style(style));
+            }
+        };
+        let on_change = changed.clone();
+        kind.connect_selected_notify(move |_| on_change());
+        let on_change = changed.clone();
+        stroke.connect_rgba_notify(move |_| on_change());
+        let on_change = changed.clone();
+        width.connect_value_changed(move |_| on_change());
+        let on_change = changed.clone();
+        fill.connect_rgba_notify(move |_| on_change());
+        let fill_c = fill.clone();
+        fill_on.connect_toggled(move |check| {
+            fill_c.set_sensitive(check.is_active());
+            changed();
+        });
+
+        let options = &self.tool_options;
+        options.append(&kind);
+        options.append(&gtk::Label::new(Some("Stroke")));
+        options.append(&stroke);
+        options.append(&width);
+        options.append(&fill_on);
+        options.append(&fill);
+        options.append(&hint_label(
+            "Drag to draw. Shift keeps squares, circles, and 45° angles. These options restyle the selected shape too.",
+        ));
+    }
+
+    /// Use `style` for new shapes, and restyle the one selected shape.
+    fn set_shape_style(self: &Rc<Self>, style: ShapeStyle) {
+        let target = {
+            let mut model = self.model.borrow_mut();
+            model.shape_style = style;
+            model.session.as_ref().and_then(|session| {
+                let doc = session.editor.document();
+                let layer = doc.active_layer().filter(|layer| !layer.locked)?;
+                match &layer.kind {
+                    LayerKind::Shape { spec, .. } => Some((doc.active_index()?, spec.dx, spec.dy)),
+                    _ => None,
+                }
+            })
+        };
+        if let Some((index, dx, dy)) = target {
+            self.edit(Command::SetShape {
+                index,
+                spec: style.spec(dx, dy),
+            });
+        }
     }
 
     pub fn set_active_blend(self: &Rc<Self>, blend: BlendMode) {
@@ -944,6 +1166,16 @@ impl Shell {
         }
     }
 
+    /// The selected layers, bottom to top.
+    fn selected(&self) -> Vec<usize> {
+        self.model
+            .borrow()
+            .session
+            .as_ref()
+            .map(|session| session.editor.document().selected_indices())
+            .unwrap_or_default()
+    }
+
     fn delete_selected(self: &Rc<Self>) {
         let indices = self
             .model
@@ -1033,6 +1265,10 @@ impl Shell {
                 .set_active(matches!(session.tool, Tool::Move));
             self.crop_tool
                 .set_active(matches!(session.tool, Tool::Crop));
+            self.text_tool
+                .set_active(matches!(session.tool, Tool::Text));
+            self.shape_tool
+                .set_active(matches!(session.tool, Tool::Shape));
             self.undo_btn.set_sensitive(session.editor.can_undo());
             self.redo_btn.set_sensitive(session.editor.can_redo());
             self.export_btn.set_sensitive(true);
@@ -1052,13 +1288,24 @@ impl Shell {
             for (name, _) in DISTRIBUTIONS {
                 self.enable(name, movable >= 3);
             }
-            let editable = active.is_some_and(|layer| !layer.locked);
+            let editable = active.is_some_and(|layer| {
+                !layer.locked && !matches!(layer.kind, LayerKind::Group { .. })
+            });
+            self.enable("group", !doc.selected_indices().is_empty());
+            self.enable(
+                "ungroup",
+                active.is_some_and(|layer| matches!(layer.kind, LayerKind::Group { .. })),
+            );
             for name in ["rotate-layer", "flip-layer-h", "flip-layer-v"] {
                 self.enable(name, editable);
             }
             for (name, _) in ADJUSTMENTS {
                 self.enable(name, editable);
             }
+            let unlocked = active.filter(|layer| !layer.locked);
+            let text = unlocked.is_some_and(|layer| matches!(layer.kind, LayerKind::Text { .. }));
+            self.enable("edit-text", text);
+            self.enable("rasterize", unlocked.is_some_and(|layer| layer.is_vector()));
             drop(model);
             self.fill_tool_options();
             let model = self.model.borrow();
@@ -1141,6 +1388,12 @@ impl Shell {
             "tool-select",
             "tool-move",
             "tool-crop",
+            "tool-text",
+            "tool-shape",
+            "group",
+            "ungroup",
+            "edit-text",
+            "rasterize",
             "undo",
             "redo",
         ] {
@@ -1168,6 +1421,25 @@ impl Shell {
                 self.tool_options.append(&hint_label(
                     "Drag the selection to move it. With one layer selected, handles resize it and the round handle rotates it. Shift locks the aspect ratio, and snaps rotation to 45°. Arrow keys nudge 1 px, Shift nudges 10.",
                 ));
+            }
+            Tool::Text => {
+                self.tool_options.append(&hint_label(
+                    "Click to add text, or click text to change it. Layer ▸ Edit Text… changes the selected text layer.",
+                ));
+            }
+            Tool::Shape => {
+                let style = match session
+                    .editor
+                    .document()
+                    .active_layer()
+                    .map(|layer| &layer.kind)
+                {
+                    Some(LayerKind::Shape { spec, .. }) => ShapeStyle::of(spec),
+                    _ => model.shape_style,
+                };
+                drop(model);
+                self.fill_shape_options(style);
+                return;
             }
             Tool::Crop => {
                 let label = hint_label(&crop_hint(session.crop));
@@ -1200,7 +1472,8 @@ impl Shell {
                 } else {
                     match session.tool {
                         Tool::Select | Tool::Move => "default",
-                        Tool::Crop => "crosshair",
+                        Tool::Crop | Tool::Shape => "crosshair",
+                        Tool::Text => "text",
                     }
                 }
             })
@@ -1659,15 +1932,30 @@ impl Shell {
         })
     }
 
+    /// Trade places with the next layer or group up or down, within the same
+    /// group.
     fn reorder_active(self: &Rc<Self>, delta: isize) {
-        let Some((from, len)) = self.model.borrow().session.as_ref().and_then(|session| {
+        let Some((from, to)) = self.model.borrow().session.as_ref().and_then(|session| {
             let doc = session.editor.document();
-            Some((doc.active_index()?, doc.layers().len()))
+            let from = doc.active_index()?;
+            Some((from, doc.sibling(from, delta > 0)?))
         }) else {
             return;
         };
-        let to = (from as isize + delta).clamp(0, len as isize - 1) as usize;
         self.edit(Command::Reorder { from, to });
+    }
+
+    /// Fold a group away in the layers panel, or open it.
+    pub fn set_collapsed(self: &Rc<Self>, index: usize, collapsed: bool) {
+        let changed = self
+            .model
+            .borrow_mut()
+            .session
+            .as_mut()
+            .is_some_and(|session| session.editor.set_collapsed(index, collapsed).is_ok());
+        if changed {
+            self.refresh();
+        }
     }
 
     fn undo(self: &Rc<Self>) {
@@ -2002,6 +2290,24 @@ impl Shell {
                     origin_y: y,
                 }
             }
+            Tool::Text => {
+                let (px, py) = widget_to_doc(session, x, y);
+                drop(model);
+                // The dialog shouldn't open inside the press it came from.
+                let shell = self.clone();
+                glib::idle_add_local_once(move || shell.text_at(px, py));
+                return;
+            }
+            Tool::Shape => {
+                let targets = SnapTargets::collect(session.editor.document(), &[], view.guides);
+                let (px, py) = widget_to_doc(session, x, y);
+                let (ax, ay) = snap_point(session, &targets, px, py, view.snap).0;
+                Drag {
+                    kind: DragKind::Shape { ax, ay, targets },
+                    origin_x: x,
+                    origin_y: y,
+                }
+            }
         };
         drop(model);
         *self.drag.borrow_mut() = Some(drag);
@@ -2099,6 +2405,18 @@ impl Shell {
                 }
                 self.canvas.queue_draw();
             }
+            DragKind::Shape { ax, ay, targets } => {
+                let mut model = self.model.borrow_mut();
+                let style = model.shape_style;
+                if let Some(session) = model.session.as_mut() {
+                    let (draft, lines) =
+                        shape_draft(session, style, &targets, (ax, ay), x, y, shift, snap);
+                    session.shape_draft = draft;
+                    session.snap_lines = lines;
+                }
+                drop(model);
+                self.canvas.queue_draw();
+            }
             DragKind::Select { ax, ay } => {
                 let travelled = (x - drag.origin_x).hypot(y - drag.origin_y);
                 let mut model = self.model.borrow_mut();
@@ -2160,6 +2478,25 @@ impl Shell {
                     (dx, dy)
                 };
                 self.edit(Command::MoveLayers { indices, dx, dy });
+            }
+            DragKind::Shape { ax, ay, targets } => {
+                let draft = {
+                    let mut model = self.model.borrow_mut();
+                    let style = model.shape_style;
+                    let Some(session) = model.session.as_mut() else {
+                        return;
+                    };
+                    session.shape_draft = None;
+                    shape_draft(session, style, &targets, (ax, ay), x, y, shift, snap).0
+                };
+                match draft {
+                    Some(draft) => self.edit(Command::AddShape {
+                        spec: draft.spec,
+                        x: draft.x as i32,
+                        y: draft.y as i32,
+                    }),
+                    None => self.canvas.queue_draw(),
+                }
             }
             DragKind::Guide {
                 vertical,
@@ -2466,9 +2803,13 @@ fn app_menu(recent: &gio::Menu) -> gio::Menu {
         menu.append_item(&menu_item("Add Image as Layer…", "place"));
         menu.append_item(&menu_item("Duplicate", "duplicate"));
         menu.append_item(&menu_item("Delete", "delete-layer"));
+        menu.append_item(&menu_item("Edit Text…", "edit-text"));
+        menu.append_item(&menu_item("Rasterize", "rasterize"));
         menu.append_item(&menu_item("Rotate…", "rotate-layer"));
         menu.append_item(&menu_item("Flip Horizontal", "flip-layer-h"));
         menu.append_item(&menu_item("Flip Vertical", "flip-layer-v"));
+        menu.append_item(&menu_item("Group", "group"));
+        menu.append_item(&menu_item("Ungroup", "ungroup"));
         menu.append_item(&menu_item("Raise", "raise"));
         menu.append_item(&menu_item("Lower", "lower"));
         menu
@@ -2545,6 +2886,8 @@ fn app_menu(recent: &gio::Menu) -> gio::Menu {
             menu.append_item(&menu_item("Select Tool", "tool-select"));
             menu.append_item(&menu_item("Move Tool", "tool-move"));
             menu.append_item(&menu_item("Crop Tool", "tool-crop"));
+            menu.append_item(&menu_item("Text Tool", "tool-text"));
+            menu.append_item(&menu_item("Shape Tool", "tool-shape"));
             menu
         });
         menu
@@ -2555,10 +2898,12 @@ fn app_menu(recent: &gio::Menu) -> gio::Menu {
 /// Shortcuts that must not beat a focused text field to the key: single keys,
 /// and the clipboard and selection keys a text field uses too. The first
 /// alternative is the one menus show.
-const EDITING_SHORTCUTS: [(&str, &str); 12] = [
+const EDITING_SHORTCUTS: [(&str, &str); 14] = [
     ("tool-select", "v"),
     ("tool-move", "m"),
     ("tool-crop", "c"),
+    ("tool-text", "t"),
+    ("tool-shape", "u"),
     ("cut", "<Control>x"),
     ("copy", "<Control>c"),
     ("copy-image", "<Control><Shift>c"),
@@ -2837,7 +3182,8 @@ fn select_under_pointer(session: &mut super::model::Session, x: f64, y: f64) -> 
     let (dx, dy) = widget_to_doc(session, x, y);
     let doc = session.editor.document();
     match doc.unlocked_layer_at(dx, dy) {
-        Some(index) if doc.is_selected(index) => false,
+        // A layer inside a selected group moves with it.
+        Some(index) if selected_or_inside_selection(doc, index) => false,
         Some(index) => session.editor.set_active(index).is_ok(),
         None if pointer_in_selection(session, x, y) => false,
         None if doc.selected_indices().is_empty() => false,
@@ -2857,6 +3203,8 @@ fn move_drag(session: &super::model::Session, x: f64, y: f64, guides: bool) -> O
         if indices.is_empty() {
             return None;
         }
+        // Everything inside a moving group moves with it.
+        let indices = doc.with_contents(&indices);
         return Some(DragKind::Move {
             bounds: moving_bounds(doc, &indices),
             targets: SnapTargets::collect(doc, &indices, guides),
@@ -2887,11 +3235,14 @@ fn move_drag(session: &super::model::Session, x: f64, y: f64, guides: bool) -> O
             origin: bounds,
             targets,
         },
-        None => DragKind::Move {
-            indices: vec![index],
-            bounds: moving_bounds(doc, &[index]),
-            targets,
-        },
+        None => {
+            let indices = doc.with_contents(&[index]);
+            DragKind::Move {
+                bounds: moving_bounds(doc, &indices),
+                targets: SnapTargets::collect(doc, &indices, guides),
+                indices,
+            }
+        }
     };
     Some(kind)
 }
@@ -2932,7 +3283,9 @@ fn pointer_on_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
 
 /// A locked layer has no handles, so this is `None` for one.
 fn hit_at(session: &super::model::Session, x: f64, y: f64) -> Option<Handle> {
-    if session.editor.document().active_layer()?.locked {
+    let layer = session.editor.document().active_layer()?;
+    // Groups move but don't resize or rotate.
+    if layer.locked || matches!(layer.kind, LayerKind::Group { .. }) {
         return None;
     }
     let bounds = active_bounds(session)?;
@@ -2962,7 +3315,8 @@ fn hover_cursor(
     let name = match session.tool {
         Tool::Select if session.space_down => "grab",
         Tool::Select => "default",
-        Tool::Crop => "crosshair",
+        Tool::Crop | Tool::Shape => "crosshair",
+        Tool::Text => "text",
         Tool::Move => match hit_at(session, x, y) {
             Some(Handle::Rotate) => "crosshair",
             Some(Handle::North | Handle::South) => "ns-resize",
@@ -2980,6 +3334,98 @@ fn hover_cursor(
         },
     };
     Some(name)
+}
+
+/// Whether the layer, or a group it is in, is selected.
+fn selected_or_inside_selection(doc: &Document, index: usize) -> bool {
+    let mut at = Some(index);
+    while let Some(index) = at {
+        if doc.is_selected(index) {
+            return true;
+        }
+        at = doc.parent_index(index);
+    }
+    false
+}
+
+/// The default color for text and shapes: a red that stands out on most
+/// screenshots.
+const ANNOTATION_RED: [u8; 4] = [229, 72, 77, 255];
+
+/// A point pulled onto nearby lines when `snap` is on, with the lines it
+/// snapped to.
+fn snap_point(
+    session: &super::model::Session,
+    targets: &SnapTargets,
+    x: f64,
+    y: f64,
+    snap: bool,
+) -> ((f64, f64), Vec<SnapLine>) {
+    let mut lines = Vec::new();
+    if !snap {
+        return ((x, y), lines);
+    }
+    let reach = SNAP_DISTANCE / session.zoom;
+    let x = match snap_lines(&[x], &targets.x, reach) {
+        Some((_, line)) => {
+            lines.push(SnapLine::X(line));
+            line
+        }
+        None => x,
+    };
+    let y = match snap_lines(&[y], &targets.y, reach) {
+        Some((_, line)) => {
+            lines.push(SnapLine::Y(line));
+            line
+        }
+        None => y,
+    };
+    ((x, y), lines)
+}
+
+/// The shape a drag from `start` to `(x, y)` draws. Shift makes squares and
+/// circles, and turns lines in steps of 45°. `None` while it is too small to
+/// keep.
+#[allow(clippy::too_many_arguments)]
+fn shape_draft(
+    session: &super::model::Session,
+    style: ShapeStyle,
+    targets: &SnapTargets,
+    start: (f64, f64),
+    x: f64,
+    y: f64,
+    shift: bool,
+    snap: bool,
+) -> (Option<ShapeDraft>, Vec<SnapLine>) {
+    let (px, py) = widget_to_doc(session, x, y);
+    let ((px, py), lines) = snap_point(session, targets, px, py, snap && !shift);
+    let (mut dx, mut dy) = (px - start.0, py - start.1);
+    if shift {
+        match style.kind {
+            ShapeKind::Rectangle | ShapeKind::Ellipse => {
+                let side = dx.abs().max(dy.abs());
+                dx = side.copysign(dx);
+                dy = side.copysign(dy);
+            }
+            ShapeKind::Line | ShapeKind::Arrow => {
+                let step = std::f64::consts::FRAC_PI_4;
+                let angle = (dy.atan2(dx) / step).round() * step;
+                let length = dx.hypot(dy);
+                dx = length * angle.cos();
+                dy = length * angle.sin();
+            }
+        }
+    }
+    let (dx, dy) = (dx.round(), dy.round());
+    if dx.abs() < 2.0 && dy.abs() < 2.0 {
+        return (None, lines);
+    }
+    let draft = ShapeDraft {
+        spec: style.spec(dx as f32, dy as f32),
+        x: (start.0 + dx.min(0.0)).round(),
+        y: (start.1 + dy.min(0.0)).round(),
+    };
+    (Some(draft), lines)
 }
 
 /// The view settings that shape a drag or a hover.
@@ -3008,7 +3454,7 @@ const GUIDE_REACH: f64 = 4.0;
 
 /// What a press at `(x, y)` does with guides: pull a new one out of a ruler,
 /// with `None`, or pick up an existing one by its place in its list. Handles
-/// win over guides, and the crop tool ignores them.
+/// win over guides, and only the select and move tools pick them up.
 fn guide_pickup(
     session: &super::model::Session,
     view: View,
@@ -3023,7 +3469,7 @@ fn guide_pickup(
             (false, false) => {}
         }
     }
-    if !view.guides || session.tool == Tool::Crop {
+    if !view.guides || !matches!(session.tool, Tool::Select | Tool::Move) {
         return None;
     }
     if session.tool == Tool::Move && hit_at(session, x, y).is_some() {

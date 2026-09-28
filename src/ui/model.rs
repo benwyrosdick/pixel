@@ -3,7 +3,7 @@
 use image::RgbaImage;
 use pixel::document::{
     composite_with, rotate_bitmap, rotated_bounds, Background, Document, Editor, LayerOverride,
-    PixelRect,
+    PixelRect, ShapeKind, ShapeSpec, TextSpec,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -11,6 +11,49 @@ pub enum Tool {
     Select,
     Move,
     Crop,
+    Text,
+    Shape,
+}
+
+/// How the Shape tool draws: its kind and style. Changing it restyles the
+/// selected shape too.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeStyle {
+    pub kind: ShapeKind,
+    pub stroke: [u8; 4],
+    pub stroke_width: f32,
+    pub fill: Option<[u8; 4]>,
+}
+
+impl ShapeStyle {
+    pub fn spec(self, dx: f32, dy: f32) -> ShapeSpec {
+        ShapeSpec {
+            kind: self.kind,
+            dx,
+            dy,
+            stroke: self.stroke,
+            stroke_width: self.stroke_width,
+            fill: self.fill,
+        }
+    }
+
+    pub fn of(spec: &ShapeSpec) -> Self {
+        Self {
+            kind: spec.kind,
+            stroke: spec.stroke,
+            stroke_width: spec.stroke_width,
+            fill: spec.fill,
+        }
+    }
+}
+
+/// A shape being dragged out, with its box starting at `(x, y)` in document
+/// pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShapeDraft {
+    pub spec: ShapeSpec,
+    pub x: f64,
+    pub y: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +110,7 @@ pub struct Session {
     pub snap_lines: Vec<SnapLine>,
     /// A guide being dragged out of a ruler or moved.
     pub guide_draft: Option<GuideDraft>,
+    pub shape_draft: Option<ShapeDraft>,
     pub preview: Option<Preview>,
     /// Bumped whenever the flattened image changes. Pan and zoom do not bump it.
     pub visual: u64,
@@ -104,6 +148,9 @@ pub struct Model {
     pub show_rulers: bool,
     pub show_guides: bool,
     pub snap: bool,
+    pub shape_style: ShapeStyle,
+    /// The style new text starts with: the last one used.
+    pub text_style: TextSpec,
 }
 
 impl Model {
@@ -122,6 +169,7 @@ impl Model {
             marquee: None,
             snap_lines: Vec::new(),
             guide_draft: None,
+            shape_draft: None,
             preview: None,
             visual: 1,
             cursor: None,
@@ -228,6 +276,31 @@ pub fn active_bounds(session: &Session) -> Option<PixelRect> {
 /// Where a layer is drawn, including an in-progress move, resize, or rotate.
 pub fn layer_bounds(session: &Session, index: usize) -> PixelRect {
     let doc = session.editor.document();
+    if doc.is_group(index) {
+        // A group's box is the one around everything in it.
+        let block = doc.block(index);
+        return (block.start..index)
+            .filter(|&at| !doc.is_group(at))
+            .map(|at| layer_bounds(session, at))
+            .reduce(|a, b| {
+                let left = a.x.min(b.x);
+                let top = a.y.min(b.y);
+                let right = (a.x + a.width as i32).max(b.x + b.width as i32);
+                let bottom = (a.y + a.height as i32).max(b.y + b.height as i32);
+                PixelRect {
+                    x: left,
+                    y: top,
+                    width: (right - left) as u32,
+                    height: (bottom - top) as u32,
+                }
+            })
+            .unwrap_or(PixelRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+    }
     let layer = &doc.layers()[index];
     match session.preview {
         Some(Preview::Move {

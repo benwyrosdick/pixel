@@ -24,7 +24,7 @@ impl SnapTargets {
             y: vec![0.0, h / 2.0, h],
         };
         for (index, layer) in doc.layers().iter().enumerate() {
-            if !layer.visible || moving.contains(&index) {
+            if !doc.shown(index) || moving.contains(&index) {
                 continue;
             }
             if let Some(rect) = layer.content_bounds() {
@@ -72,17 +72,21 @@ pub fn snap_lines(lines: &[f64], targets: &[f64], tolerance: f64) -> Option<(f64
 }
 
 /// The box around the drawn pixels of `indices`, falling back to their layer
-/// boxes when they draw nothing. `None` for an empty list.
+/// boxes when they draw nothing. Groups draw nothing of their own, so they
+/// add nothing. `None` for an empty list.
 pub fn moving_bounds(doc: &Document, indices: &[usize]) -> Option<PixelRect> {
-    let rects = indices.iter().map(|&index| {
-        let layer = &doc.layers()[index];
-        layer.content_bounds().unwrap_or(PixelRect {
-            x: layer.x,
-            y: layer.y,
-            width: layer.width(),
-            height: layer.height(),
-        })
-    });
+    let rects = indices
+        .iter()
+        .filter(|&&index| !doc.is_group(index))
+        .map(|&index| {
+            let layer = &doc.layers()[index];
+            layer.content_bounds().unwrap_or(PixelRect {
+                x: layer.x,
+                y: layer.y,
+                width: layer.width(),
+                height: layer.height(),
+            })
+        });
     rects.reduce(|a, b| {
         let left = a.x.min(b.x);
         let top = a.y.min(b.y);

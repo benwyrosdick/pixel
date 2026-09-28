@@ -2,7 +2,9 @@
 
 use gtk::prelude::*;
 use gtk::{gdk, glib};
-use pixel::document::{Anchor, Background, ExportFormat, NewCanvas, ScaleFilter, MAX_EDGE};
+use pixel::document::{
+    Anchor, Background, ExportFormat, NewCanvas, ScaleFilter, TextAlign, TextSpec, MAX_EDGE,
+};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -244,6 +246,92 @@ pub fn rotate_layer(parent: &impl IsA<gtk::Window>, on_ok: impl Fn(f32) + 'stati
     dialog.present();
 }
 
+/// Write new text, or change a text layer's. `confirm` labels the button.
+pub fn text(
+    parent: &impl IsA<gtk::Window>,
+    title: &str,
+    confirm: &str,
+    initial: &TextSpec,
+    on_ok: impl Fn(TextSpec) + 'static,
+) {
+    let dialog = form_window(parent, title);
+    let form = padded_column();
+
+    let buffer = gtk::TextBuffer::new(None);
+    buffer.set_text(&initial.text);
+    let view = gtk::TextView::with_buffer(&buffer);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    view.set_accepts_tab(false);
+    for set_margin in [
+        gtk::TextView::set_top_margin,
+        gtk::TextView::set_bottom_margin,
+        gtk::TextView::set_left_margin,
+        gtk::TextView::set_right_margin,
+    ] {
+        set_margin(&view, 8);
+    }
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_min_content_height(96);
+    scroller.set_child(Some(&view));
+    scroller.add_css_class("card");
+    form.append(&scroller);
+
+    let font = gtk::FontDialogButton::new(Some(gtk::FontDialog::new()));
+    // The size is its own field, in pixels, so pick only the face here.
+    font.set_level(gtk::FontLevel::Face);
+    font.set_font_desc(&gtk::pango::FontDescription::from_string(&initial.font));
+    font.set_hexpand(true);
+    form.append(&labeled("Font", &font));
+
+    let size = gtk::SpinButton::with_range(4.0, 1000.0, 1.0);
+    size.set_digits(0);
+    size.set_value(initial.size as f64);
+    size.set_hexpand(true);
+    form.append(&labeled("Size", &size));
+
+    let color = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    color.set_rgba(&rgba_color(initial.color));
+    color.set_hexpand(true);
+    form.append(&labeled("Color", &color));
+
+    let align = gtk::DropDown::from_strings(&["Left", "Center", "Right"]);
+    align.set_selected(match initial.align {
+        TextAlign::Left => 0,
+        TextAlign::Center => 1,
+        TextAlign::Right => 2,
+    });
+    align.set_hexpand(true);
+    form.append(&labeled("Align", &align));
+
+    let apply = gtk::Button::with_label(confirm);
+    apply.add_css_class("suggested-action");
+    let dialog_ok = dialog.clone();
+    apply.connect_clicked(move |_| {
+        let mut face = font
+            .font_desc()
+            .unwrap_or_else(|| gtk::pango::FontDescription::from_string("Sans"));
+        face.unset_fields(gtk::pango::FontMask::SIZE);
+        let (start, end) = buffer.bounds();
+        let spec = TextSpec {
+            text: buffer.text(&start, &end, false).to_string(),
+            font: face.to_string(),
+            size: size.value() as f32,
+            color: rgba_bytes(color.rgba()),
+            align: match align.selected() {
+                1 => TextAlign::Center,
+                2 => TextAlign::Right,
+                _ => TextAlign::Left,
+            },
+        };
+        dialog_ok.close();
+        on_ok(spec);
+    });
+    form.append(&button_row(&cancel_button(&dialog), &apply));
+    dialog.set_child(Some(&form));
+    dialog.present();
+    view.grab_focus();
+}
+
 /// One slider in an adjustment dialog.
 pub struct Slider {
     pub label: &'static str,
@@ -468,7 +556,12 @@ fn anchor_picker() -> (gtk::Grid, Rc<Cell<Anchor>>) {
     (grid, selected)
 }
 
-fn rgba_bytes(color: gdk::RGBA) -> [u8; 4] {
+pub(super) fn rgba_color([r, g, b, a]: [u8; 4]) -> gdk::RGBA {
+    let unit = |v: u8| v as f32 / 255.0;
+    gdk::RGBA::new(unit(r), unit(g), unit(b), unit(a))
+}
+
+pub(super) fn rgba_bytes(color: gdk::RGBA) -> [u8; 4] {
     [
         (color.red() * 255.0).round() as u8,
         (color.green() * 255.0).round() as u8,

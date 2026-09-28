@@ -1,6 +1,6 @@
 # Pixel
 
-A photo editor for Omarchy. The first version sets up a canvas, stacks raster layers, and exports a flattened image. Crop, resize, rotate, and flip are the editing tools, with color adjustments, blur and sharpen, and blend modes. Painting, masks, and Photoshop files are not in this version.
+A photo editor for Omarchy. The first version sets up a canvas, stacks raster layers, and exports a flattened image. Crop, resize, rotate, and flip are the editing tools, with color adjustments, blur and sharpen, and blend modes. Text and shape layers stay editable, and layers can be grouped. Painting, masks, and Photoshop files are not in this version.
 
 ## Run
 
@@ -39,6 +39,8 @@ The window reads `~/.local/state/omarchy/current/theme/colors.toml` and follows 
 | Zoom in / out | + / − |
 | Fit / actual size | Ctrl+0 / Ctrl+1 |
 | Select / move / crop | V / M / C |
+| Text / shape | T / U |
+| Group / ungroup | Ctrl+G / Ctrl+Shift+G |
 | Select all / deselect | Ctrl+A / Ctrl+Shift+A or Esc |
 | Add to or remove from the selection | Shift-click, or Shift-drag a box |
 | Nudge the selected layers | Arrow keys, Shift for 10 px |
@@ -50,6 +52,10 @@ The window reads `~/.local/state/omarchy/current/theme/colors.toml` and follows 
 | Skip snapping for one drag | Hold Ctrl |
 
 Dragging a layer or a resize handle snaps its edges and centre to the canvas, to what other layers draw, and to guides, with a pink line showing what it snapped to. Drag out of a ruler to add a guide, drag a guide to move it, and drag it back onto its ruler to remove it. Guides are saved in the project. The Position and size fields under the layers set the selected layer's exact box.
+
+The Text tool adds text where you click, or changes the text you click on. The Shape tool draws rectangles, ellipses, lines, and arrows, and its options restyle the selected shape. Moving and resizing keep text and shapes editable. Rotating, flipping, or adjusting one turns it into plain pixels, as Layer ▸ Rasterize does.
+
+Layer ▸ Group gathers the selected layers into a group, which moves, hides, and fades as one. Drop a layer onto a group's row to put it inside. A group at full opacity in Normal mode lets its layers blend with what is below it; below full opacity, or in another mode, its layers are flattened together first.
 
 The Adjust menu changes the selected layer's pixels: brightness and contrast, hue and saturation, levels, grayscale, blur, and sharpen. Each dialog previews on the canvas until you apply or cancel it. Each layer has a blend mode, such as Multiply, Screen, or Overlay, picked under the opacity slider.
 

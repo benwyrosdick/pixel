@@ -12,5 +12,7 @@
     <file>pixel-tool-select-symbolic.svg</file>
     <file>pixel-tool-move-symbolic.svg</file>
     <file>pixel-tool-crop-symbolic.svg</file>
+    <file>pixel-tool-text-symbolic.svg</file>
+    <file>pixel-tool-shape-symbolic.svg</file>
   </gresource>
 </gresources>

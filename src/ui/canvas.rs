@@ -9,7 +9,7 @@ use gtk::glib;
 use gtk::graphene;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use pixel::document::{rotate_handle_point, ROTATE_OFFSET};
+use pixel::document::{render_shape, rotate_handle_point, ROTATE_OFFSET};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 
@@ -116,6 +116,7 @@ mod imp {
             if model.show_guides {
                 draw_guides(snapshot, session, width as f64, height as f64);
             }
+            draw_shape_draft(snapshot, session);
             draw_smart_guides(snapshot, session, width as f64, height as f64);
             if model.show_rulers {
                 self.draw_rulers(snapshot, session, &model, width as f64, height as f64);
@@ -393,7 +394,9 @@ fn draw_selection(snapshot: &gtk::Snapshot, session: &Session, accent: (f32, f32
     let doc = session.editor.document();
     let (r, g, b) = accent;
     let stroke = gdk::RGBA::new(r, g, b, 1.0);
-    let editable = doc.active_layer().is_some_and(|layer| !layer.locked);
+    let editable = doc.active_layer().is_some_and(|layer| {
+        !layer.locked && !matches!(layer.kind, pixel::document::LayerKind::Group { .. })
+    });
     if session.tool == Tool::Move && editable {
         draw_handles(snapshot, session, accent);
     } else {
@@ -519,6 +522,31 @@ fn draw_guides(snapshot: &gtk::Snapshot, session: &Session, width: f64, height: 
             horizontal_line(snapshot, session, draft.position, width, &color);
         }
     }
+}
+
+/// The shape being dragged out, drawn as it will look.
+fn draw_shape_draft(snapshot: &gtk::Snapshot, session: &Session) {
+    let Some(draft) = &session.shape_draft else {
+        return;
+    };
+    let rendered = render_shape(&draft.spec);
+    let texture = upload(&rendered.pixels);
+    snapshot.save();
+    snapshot.translate(&graphene::Point::new(
+        session.pan_x as f32,
+        session.pan_y as f32,
+    ));
+    snapshot.scale(session.zoom as f32, session.zoom as f32);
+    snapshot.append_texture(
+        &texture,
+        &graphene::Rect::new(
+            (draft.x - rendered.origin.0 as f64) as f32,
+            (draft.y - rendered.origin.1 as f64) as f32,
+            rendered.pixels.width() as f32,
+            rendered.pixels.height() as f32,
+        ),
+    );
+    snapshot.restore();
 }
 
 fn draw_smart_guides(snapshot: &gtk::Snapshot, session: &Session, width: f64, height: f64) {

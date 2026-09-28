@@ -3,9 +3,11 @@
 mod adjust;
 mod arrange;
 mod composite;
+mod groups;
 mod handles;
 mod io;
 mod ops;
+mod render;
 
 pub use adjust::{adjust, Adjustment};
 pub use composite::{composite, composite_layers, composite_with, LayerOverride};
@@ -15,6 +17,7 @@ pub use handles::{
 };
 pub use io::{export, open_image, open_project, save_project, ExportFormat};
 pub use ops::rotate_bitmap;
+pub use render::{render_shape, render_text, Rendered, ShapeKind, ShapeSpec, TextAlign, TextSpec};
 
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
@@ -46,6 +49,8 @@ pub enum Error {
     BadProject,
     #[error("the layer is locked")]
     Locked,
+    #[error("that layer can't be edited this way")]
+    WrongKind,
 }
 
 /// How a layer's colors mix with the layers under it. The formulas are the
@@ -221,7 +226,26 @@ pub struct Layer {
     pub blend: BlendMode,
     pub x: i32,
     pub y: i32,
+    /// What the layer draws. Text and shape layers keep their drawing here
+    /// too, redrawn from their description whenever it changes.
     pub pixels: RgbaImage,
+    pub kind: LayerKind,
+    /// The id of the group the layer is in, if any.
+    pub parent: Option<u64>,
+}
+
+/// What a layer is made of.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum LayerKind {
+    #[default]
+    Raster,
+    /// `origin` is where the text's own top-left corner sits in the pixels.
+    Text { spec: TextSpec, origin: (i32, i32) },
+    /// `origin` is where the shape's box starts in the pixels.
+    Shape { spec: ShapeSpec, origin: (i32, i32) },
+    /// Holds the layers right below it that name it as their group. It draws
+    /// nothing itself. `collapsed` hides its contents in the layers panel.
+    Group { collapsed: bool },
 }
 
 impl Layer {
@@ -231,6 +255,47 @@ impl Layer {
 
     pub fn height(&self) -> u32 {
         self.pixels.height()
+    }
+
+    /// Whether the layer is text or a shape, drawn from a description.
+    pub fn is_vector(&self) -> bool {
+        matches!(self.kind, LayerKind::Text { .. } | LayerKind::Shape { .. })
+    }
+
+    /// Where a text or shape layer's own top-left corner sits in the document.
+    fn anchor(&self) -> Option<(i32, i32)> {
+        match self.kind {
+            LayerKind::Raster | LayerKind::Group { .. } => None,
+            LayerKind::Text { origin, .. } | LayerKind::Shape { origin, .. } => {
+                Some((self.x + origin.0, self.y + origin.1))
+            }
+        }
+    }
+
+    /// Draw a text or shape layer again from its description, with its own
+    /// top-left corner at `anchor`.
+    fn redraw(&mut self, anchor: (i32, i32)) {
+        let rendered = match &self.kind {
+            LayerKind::Raster | LayerKind::Group { .. } => return,
+            LayerKind::Text { spec, .. } => render_text(spec),
+            LayerKind::Shape { spec, .. } => render_shape(spec),
+        };
+        match &mut self.kind {
+            LayerKind::Text { origin, .. } | LayerKind::Shape { origin, .. } => {
+                *origin = rendered.origin;
+            }
+            LayerKind::Raster | LayerKind::Group { .. } => {}
+        }
+        self.pixels = rendered.pixels;
+        self.x = anchor.0 - rendered.origin.0;
+        self.y = anchor.1 - rendered.origin.1;
+    }
+
+    /// Keep the layer as it looks now, as plain pixels.
+    fn rasterize(&mut self) {
+        if self.is_vector() {
+            self.kind = LayerKind::Raster;
+        }
     }
 
     /// The box around the layer's non-transparent pixels, in document space.
@@ -389,8 +454,9 @@ impl Document {
             return None;
         }
         let (px, py) = (x.floor() as i64, y.floor() as i64);
-        self.layers.iter().rposition(|layer| {
-            if !layer.visible || (layer.locked && !include_locked) || layer.opacity <= 0.0 {
+        (0..self.layers.len()).rev().find(|&index| {
+            let layer = &self.layers[index];
+            if !self.shown(index) || (layer.locked && !include_locked) || layer.opacity <= 0.0 {
                 return false;
             }
             let lx = px - layer.x as i64;
@@ -407,8 +473,8 @@ impl Document {
     /// canvas background doesn't count. `None` when they draw nothing.
     pub fn content_bounds(&self) -> Option<PixelRect> {
         let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
-        for layer in &self.layers {
-            if !layer.visible || layer.opacity <= 0.0 {
+        for (index, layer) in self.layers.iter().enumerate() {
+            if !self.shown(index) || layer.opacity <= 0.0 {
                 continue;
             }
             let (ox, oy) = (layer.x as i64, layer.y as i64);
@@ -443,7 +509,7 @@ impl Document {
         (0..self.layers.len())
             .filter(|&index| {
                 let layer = &self.layers[index];
-                if !layer.visible || layer.opacity <= 0.0 {
+                if !self.shown(index) || layer.opacity <= 0.0 || self.is_group(index) {
                     return false;
                 }
                 let (ox, oy) = (layer.x as i64, layer.y as i64);
@@ -542,7 +608,22 @@ fn blank_layer(doc: &mut Document, name: &str) -> Layer {
         x: 0,
         y: 0,
         pixels: RgbaImage::new(doc.width, doc.height),
+        kind: LayerKind::Raster,
+        parent: None,
     }
+}
+
+/// A layer's name from the first line of its text.
+fn text_name(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return "Text".into();
+    }
+    let mut name: String = line.chars().take(30).collect();
+    if line.chars().count() > 30 {
+        name.push('…');
+    }
+    name
 }
 
 /// Edits the UI is allowed to make. Selection changes are not commands.
@@ -553,6 +634,45 @@ pub enum Command {
         name: String,
         image: RgbaImage,
     },
+    /// A text layer whose top-left corner is at `(x, y)`.
+    AddText {
+        spec: TextSpec,
+        x: i32,
+        y: i32,
+    },
+    /// A shape layer whose box starts at `(x, y)`.
+    AddShape {
+        spec: ShapeSpec,
+        x: i32,
+        y: i32,
+    },
+    /// Change a text layer's text or style. Its top-left corner stays put.
+    SetText {
+        index: usize,
+        spec: TextSpec,
+    },
+    /// Change a shape layer's shape or style. Its box stays where it starts.
+    SetShape {
+        index: usize,
+        spec: ShapeSpec,
+    },
+    /// Turn a text or shape layer into plain pixels.
+    Rasterize {
+        index: usize,
+    },
+    /// Gather layers into a new group, where the topmost of them was.
+    Group {
+        indices: Vec<usize>,
+    },
+    /// Take a group apart, leaving its contents in place.
+    Ungroup {
+        index: usize,
+    },
+    /// Move a layer, or a group with its contents, to the top of a group.
+    MoveIntoGroup {
+        index: usize,
+        group: usize,
+    },
     DuplicateLayer {
         index: usize,
     },
@@ -560,7 +680,8 @@ pub enum Command {
     DeleteLayers {
         indices: Vec<usize>,
     },
-    /// `to` is the index the layer occupies after the move.
+    /// Move `from`, and everything in it, to where `to` is, beside it in the
+    /// same group: above it when moving up, below it when moving down.
     Reorder {
         from: usize,
         to: usize,
@@ -677,6 +798,13 @@ impl Command {
                 | Self::FlipCanvas { .. }
                 | Self::FlipLayer { .. }
                 | Self::Adjust { .. }
+                | Self::AddText { .. }
+                | Self::AddShape { .. }
+                | Self::SetText { .. }
+                | Self::SetShape { .. }
+                | Self::Rasterize { .. }
+                | Self::Group { .. }
+                | Self::Ungroup { .. }
         )
     }
 }
@@ -684,6 +812,7 @@ impl Command {
 #[derive(Clone)]
 struct GeomLayer {
     id: u64,
+    parent: Option<u64>,
     name: String,
     visible: bool,
     locked: bool,
@@ -755,6 +884,18 @@ impl Editor {
         Ok(())
     }
 
+    /// Fold a group away in the layers panel, or open it. This is not an
+    /// edit, so it isn't undone.
+    pub fn set_collapsed(&mut self, index: usize, collapsed: bool) -> Result<(), Error> {
+        match &mut self.doc.layer_mut(index)?.kind {
+            LayerKind::Group { collapsed: folded } => {
+                *folded = collapsed;
+                Ok(())
+            }
+            _ => Err(Error::WrongKind),
+        }
+    }
+
     pub fn deselect(&mut self) {
         self.doc.selection.clear();
     }
@@ -819,6 +960,7 @@ fn geom_snap(doc: &Document) -> GeomSnap {
             .iter()
             .map(|layer| GeomLayer {
                 id: layer.id,
+                parent: layer.parent,
                 name: layer.name.clone(),
                 visible: layer.visible,
                 locked: layer.locked,
@@ -852,6 +994,7 @@ fn restore_geom(doc: &mut Document, snap: GeomSnap) {
             .expect("geometry undo keeps the same layers");
         let mut layer = layers.swap_remove(pos);
         layer.name = meta.name;
+        layer.parent = meta.parent;
         layer.visible = meta.visible;
         layer.locked = meta.locked;
         layer.opacity = meta.opacity;
@@ -904,7 +1047,26 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
         }
         Command::Adjust { index, adjustment } => {
             doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            if doc.is_group(*index) {
+                return Err(Error::WrongKind);
+            }
             Ok(!adjustment.is_identity())
+        }
+        Command::AddText { .. } | Command::AddShape { .. } => Ok(true),
+        Command::SetText { index, spec } => {
+            match &doc.layers.get(*index).ok_or(Error::BadLayer)?.kind {
+                LayerKind::Text { spec: current, .. } => Ok(current != spec),
+                _ => Err(Error::WrongKind),
+            }
+        }
+        Command::SetShape { index, spec } => {
+            match &doc.layers.get(*index).ok_or(Error::BadLayer)?.kind {
+                LayerKind::Shape { spec: current, .. } => Ok(current != spec),
+                _ => Err(Error::WrongKind),
+            }
+        }
+        Command::Rasterize { index } => {
+            Ok(doc.layers.get(*index).ok_or(Error::BadLayer)?.is_vector())
         }
         Command::DistributeLayers { indices, axis } => {
             Ok(!arrange::distribute_shifts(doc, indices, *axis)?.is_empty())
@@ -913,13 +1075,35 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             if *from >= doc.layers.len() || *to >= doc.layers.len() {
                 return Err(Error::BadLayer);
             }
-            Ok(from != to)
+            Ok(!doc.block(*from).contains(to))
+        }
+        Command::Group { indices } => {
+            if indices.iter().any(|&index| index >= doc.layers.len()) {
+                return Err(Error::BadLayer);
+            }
+            Ok(!indices.is_empty())
+        }
+        Command::Ungroup { index } => {
+            if doc.is_group(*index) {
+                Ok(true)
+            } else {
+                Err(Error::WrongKind)
+            }
+        }
+        Command::MoveIntoGroup { index, group } => {
+            if *index >= doc.layers.len() || !doc.is_group(*group) {
+                return Err(Error::BadLayer);
+            }
+            if doc.block(*index).contains(group) {
+                return Err(Error::WrongKind);
+            }
+            Ok(true)
         }
         Command::DeleteLayers { indices } => {
             if indices.iter().any(|&index| index >= doc.layers.len()) {
                 return Err(Error::BadLayer);
             }
-            let unique: BTreeSet<_> = indices.iter().collect();
+            let unique = doc.with_contents(indices);
             if unique.len() >= doc.layers.len() {
                 return Err(Error::LastLayer);
             }
@@ -928,6 +1112,9 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
         Command::RotateLayer { index, degrees_cw } => {
             if *index >= doc.layers.len() {
                 return Err(Error::BadLayer);
+            }
+            if doc.is_group(*index) {
+                return Err(Error::WrongKind);
             }
             Ok(degrees_cw.abs() % 360.0 > 1e-3)
         }
@@ -948,6 +1135,9 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             ..
         } => {
             let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            if doc.is_group(*index) {
+                return Err(Error::WrongKind);
+            }
             check_size(*width, *height)?;
             Ok(layer.x != *x
                 || layer.y != *y
@@ -971,6 +1161,11 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
                     return Err(Error::BadLayer);
                 }
             }
+            if let Command::FlipLayer { index, .. } = command {
+                if doc.is_group(*index) {
+                    return Err(Error::WrongKind);
+                }
+            }
             if let Command::AddImageLayer { image, .. } = command {
                 check_size(image.width(), image.height())?;
             }
@@ -986,6 +1181,9 @@ fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
         Command::SetOpacity { index, .. }
         | Command::SetBlend { index, .. }
         | Command::Adjust { index, .. }
+        | Command::SetText { index, .. }
+        | Command::SetShape { index, .. }
+        | Command::Rasterize { index }
         | Command::MoveLayer { index, .. }
         | Command::ScaleLayer { index, .. }
         | Command::RotateLayer { index, .. }
@@ -1001,11 +1199,15 @@ fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
     Ok(())
 }
 
+/// Move each listed layer, or everything in each listed group.
 fn shift_layers(doc: &mut Document, shifts: Vec<arrange::Shift>) -> Result<(), Error> {
     for (index, dx, dy) in shifts {
-        let layer = doc.layer_mut(index)?;
-        layer.x += dx;
-        layer.y += dy;
+        let layers: Vec<usize> = doc.block(index).filter(|&at| !doc.is_group(at)).collect();
+        for at in layers {
+            let layer = doc.layer_mut(at)?;
+            layer.x += dx;
+            layer.y += dy;
+        }
     }
     Ok(())
 }
@@ -1036,23 +1238,12 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             layer.y = y;
             doc.insert_layer(layer);
         }
-        Command::DuplicateLayer { index } => {
-            let source = doc.layers.get(index).ok_or(Error::BadLayer)?.clone();
-            let mut layer = blank_layer(doc, &format!("{} copy", source.name));
-            layer.visible = source.visible;
-            layer.locked = source.locked;
-            layer.opacity = source.opacity;
-            layer.blend = source.blend;
-            layer.x = source.x + 16;
-            layer.y = source.y + 16;
-            layer.pixels = source.pixels;
-            doc.insert_layer(layer);
-        }
+        Command::DuplicateLayer { index } => groups::duplicate(doc, index)?,
         Command::DeleteLayers { indices } => {
-            let unique: BTreeSet<usize> = indices.into_iter().collect();
-            if unique.iter().any(|&index| index >= doc.layers.len()) {
+            if indices.iter().any(|&index| index >= doc.layers.len()) {
                 return Err(Error::BadLayer);
             }
+            let unique: BTreeSet<usize> = doc.with_contents(&indices).into_iter().collect();
             if unique.len() >= doc.layers.len() {
                 return Err(Error::LastLayer);
             }
@@ -1068,7 +1259,10 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
                 doc.selection.insert(doc.layers[next].id);
             }
         }
-        Command::Reorder { from, to } => ops::reorder(doc, from, to)?,
+        Command::Reorder { from, to } => groups::reorder(doc, from, to)?,
+        Command::Group { indices } => groups::group(doc, &indices)?,
+        Command::Ungroup { index } => groups::ungroup(doc, index)?,
+        Command::MoveIntoGroup { index, group } => groups::move_into(doc, index, group)?,
         Command::Rename { index, name } => {
             doc.layer_mut(index)?.name = name;
         }
@@ -1087,8 +1281,13 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             layer.y = y;
         }
         Command::MoveLayers { indices, dx, dy } => {
-            let unique: BTreeSet<usize> = indices.into_iter().collect();
-            for index in unique {
+            // A group has no place of its own. Moving it moves what it holds.
+            let contents: Vec<usize> = doc
+                .with_contents(&indices)
+                .into_iter()
+                .filter(|&index| !doc.is_group(index))
+                .collect();
+            for index in contents {
                 let layer = doc.layer_mut(index)?;
                 layer.x += dx;
                 layer.y += dy;
@@ -1102,8 +1301,52 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
         Command::SetBlend { index, blend } => doc.layer_mut(index)?.blend = blend,
         Command::Adjust { index, adjustment } => {
             let layer = doc.layer_mut(index)?;
+            layer.rasterize();
             layer.pixels = adjust(&layer.pixels, adjustment);
         }
+        Command::AddText { spec, x, y } => {
+            let mut layer = blank_layer(doc, &text_name(&spec.text));
+            layer.kind = LayerKind::Text {
+                spec,
+                origin: (0, 0),
+            };
+            layer.redraw((x, y));
+            doc.insert_layer(layer);
+        }
+        Command::AddShape { spec, x, y } => {
+            let name = match spec.kind {
+                ShapeKind::Rectangle => "Rectangle",
+                ShapeKind::Ellipse => "Ellipse",
+                ShapeKind::Line => "Line",
+                ShapeKind::Arrow => "Arrow",
+            };
+            let mut layer = blank_layer(doc, name);
+            layer.kind = LayerKind::Shape {
+                spec,
+                origin: (0, 0),
+            };
+            layer.redraw((x, y));
+            doc.insert_layer(layer);
+        }
+        Command::SetText { index, spec: new } => {
+            let layer = doc.layer_mut(index)?;
+            let anchor = layer.anchor().ok_or(Error::WrongKind)?;
+            match &mut layer.kind {
+                LayerKind::Text { spec, .. } => *spec = new,
+                _ => return Err(Error::WrongKind),
+            }
+            layer.redraw(anchor);
+        }
+        Command::SetShape { index, spec: new } => {
+            let layer = doc.layer_mut(index)?;
+            let anchor = layer.anchor().ok_or(Error::WrongKind)?;
+            match &mut layer.kind {
+                LayerKind::Shape { spec, .. } => *spec = new,
+                _ => return Err(Error::WrongKind),
+            }
+            layer.redraw(anchor);
+        }
+        Command::Rasterize { index } => doc.layer_mut(index)?.rasterize(),
         Command::DistributeLayers { indices, axis } => {
             let shifts = arrange::distribute_shifts(doc, &indices, axis)?;
             shift_layers(doc, shifts)?;
@@ -1133,9 +1376,15 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             filter,
         } => ops::scale_layer(doc, index, x, y, width, height, filter.image_filter())?,
         Command::RotateCanvas { turn } => ops::rotate_canvas(doc, turn),
-        Command::RotateLayer { index, degrees_cw } => ops::rotate_layer(doc, index, degrees_cw)?,
+        Command::RotateLayer { index, degrees_cw } => {
+            doc.layer_mut(index)?.rasterize();
+            ops::rotate_layer(doc, index, degrees_cw)?
+        }
         Command::FlipCanvas { axis } => ops::flip_canvas(doc, axis),
-        Command::FlipLayer { index, axis } => ops::flip_layer(doc, index, axis)?,
+        Command::FlipLayer { index, axis } => {
+            doc.layer_mut(index)?.rasterize();
+            ops::flip_layer(doc, index, axis)?
+        }
     }
     Ok(())
 }
@@ -1689,6 +1938,139 @@ mod tests {
             editor.document().layers[0].pixels.get_pixel(0, 0),
             &rgba(0, 255, 0, 255)
         );
+    }
+
+    fn label(text: &str) -> TextSpec {
+        TextSpec {
+            text: text.into(),
+            font: "Sans".into(),
+            size: 24.0,
+            color: [255, 255, 255, 255],
+            align: TextAlign::Left,
+        }
+    }
+
+    fn arrow(dx: f32, dy: f32) -> ShapeSpec {
+        ShapeSpec {
+            kind: ShapeKind::Arrow,
+            dx,
+            dy,
+            stroke: [255, 0, 0, 255],
+            stroke_width: 4.0,
+            fill: None,
+        }
+    }
+
+    #[test]
+    fn text_edits_redraw_in_place_and_undo() {
+        let mut editor = doc_with(200, 100, (0, 0), rgba(0, 0, 0, 255));
+        editor
+            .apply(Command::AddText {
+                spec: label("Hi"),
+                x: 30,
+                y: 20,
+            })
+            .unwrap();
+        let layer = &editor.document().layers[1];
+        assert_eq!(layer.name, "Hi");
+        assert_eq!(layer.anchor(), Some((30, 20)));
+        let narrow = layer.width();
+
+        editor
+            .apply(Command::SetText {
+                index: 1,
+                spec: label("Hello there"),
+            })
+            .unwrap();
+        let layer = &editor.document().layers[1];
+        assert!(layer.width() > narrow);
+        assert_eq!(layer.anchor(), Some((30, 20)), "the corner stays put");
+        editor.undo();
+        assert_eq!(editor.document().layers[1].width(), narrow);
+        assert!(matches!(
+            editor.apply(Command::SetShape {
+                index: 1,
+                spec: arrow(10.0, 0.0),
+            }),
+            Err(Error::WrongKind)
+        ));
+    }
+
+    #[test]
+    fn resizing_a_shape_redraws_it_and_rotating_turns_it_into_pixels() {
+        let mut editor = doc_with(200, 200, (0, 0), rgba(0, 0, 0, 255));
+        editor
+            .apply(Command::AddShape {
+                spec: arrow(-50.0, 20.0),
+                x: 40,
+                y: 40,
+            })
+            .unwrap();
+        let layer = &editor.document().layers[1];
+        let (pad, _) = match layer.kind {
+            LayerKind::Shape { origin, .. } => origin,
+            _ => panic!("not a shape"),
+        };
+        let (x, y) = (layer.x, layer.y);
+        editor
+            .apply(Command::ScaleLayer {
+                index: 1,
+                x,
+                y,
+                width: 100 + 2 * pad as u32,
+                height: 40 + 2 * pad as u32,
+                filter: ScaleFilter::Lanczos3,
+            })
+            .unwrap();
+        match &editor.document().layers[1].kind {
+            LayerKind::Shape { spec, .. } => {
+                assert_eq!((spec.dx, spec.dy), (-100.0, 40.0), "the direction is kept");
+            }
+            _ => panic!("scaling should keep the shape editable"),
+        }
+        editor
+            .apply(Command::RotateLayer {
+                index: 1,
+                degrees_cw: 90.0,
+            })
+            .unwrap();
+        assert_eq!(editor.document().layers[1].kind, LayerKind::Raster);
+    }
+
+    #[test]
+    fn crop_moves_text_without_cutting_it_and_image_size_scales_it() {
+        let mut editor = doc_with(200, 100, (0, 0), rgba(0, 0, 0, 255));
+        editor
+            .apply(Command::AddText {
+                spec: label("Wide label"),
+                x: 10,
+                y: 10,
+            })
+            .unwrap();
+        let width = editor.document().layers[1].width();
+        editor
+            .apply(Command::Crop {
+                x: 20,
+                y: 5,
+                width: 30,
+                height: 30,
+            })
+            .unwrap();
+        let layer = &editor.document().layers[1];
+        assert_eq!(layer.width(), width);
+        assert_eq!(layer.anchor(), Some((-10, 5)));
+        editor
+            .apply(Command::ScaleDocument {
+                width: 60,
+                height: 60,
+                filter: ScaleFilter::Lanczos3,
+            })
+            .unwrap();
+        match &editor.document().layers[1].kind {
+            LayerKind::Text { spec, .. } => assert_eq!(spec.size, 48.0),
+            _ => panic!("still text"),
+        }
+        assert_eq!(editor.document().layers[1].anchor(), Some((-20, 10)));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::shell::Shell;
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
-use pixel::document::{BlendMode, Command, Layer, PixelRect, MAX_EDGE};
+use pixel::document::{BlendMode, Command, Layer, LayerKind, PixelRect, MAX_EDGE};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -20,6 +20,9 @@ pub struct LayersPanel {
     geometry: Geometry,
     /// Thumbnails by layer id, with the pixel buffer each was made from.
     thumbnails: RefCell<HashMap<u64, Thumbnail>>,
+    /// The layer each row shows, top row first. Folded groups hide rows, so
+    /// rows and layers don't line up one to one.
+    rows: Rc<RefCell<Vec<usize>>>,
     updating: Rc<Cell<bool>>,
     dragging: Rc<Cell<bool>>,
     opacity_before: Rc<Cell<f32>>,
@@ -107,6 +110,7 @@ impl LayersPanel {
             blend,
             geometry,
             thumbnails: RefCell::new(HashMap::new()),
+            rows: Rc::new(RefCell::new(Vec::new())),
             updating: Rc::new(Cell::new(false)),
             dragging: Rc::new(Cell::new(false)),
             opacity_before: Rc::new(Cell::new(1.0)),
@@ -142,19 +146,19 @@ impl LayersPanel {
     pub fn connect(&self, shell: &Rc<Shell>) {
         let shell_select = shell.clone();
         let updating = self.updating.clone();
+        let rows = self.rows.clone();
         self.list.connect_selected_rows_changed(move |list| {
             if updating.get() {
                 return;
             }
-            let len = shell_select.layer_count();
-            // Rows run top to bottom, layers bottom to top.
-            let indices: Vec<usize> = list
+            let rows = rows.borrow();
+            let mut indices: Vec<usize> = list
                 .selected_rows()
                 .iter()
                 .filter_map(|row| usize::try_from(row.index()).ok())
-                .filter(|&visual| visual < len)
-                .map(|visual| len - 1 - visual)
+                .filter_map(|row| rows.get(row).copied())
                 .collect();
+            indices.sort_unstable();
             // Applying the selection rebuilds these rows, so wait until the
             // list has finished its own update.
             let shell = shell_select.clone();
@@ -221,10 +225,19 @@ impl LayersPanel {
         self.thumbnails
             .borrow_mut()
             .retain(|id, _| doc.layers().iter().any(|layer| layer.id == *id));
+        let mut rows = Vec::new();
         for (index, layer) in doc.layers().iter().enumerate().rev() {
-            let thumbnail = self.thumbnail(layer);
+            if doc.hidden_in_panel(index) {
+                continue;
+            }
+            let thumbnail = match layer.kind {
+                LayerKind::Group { .. } => None,
+                _ => Some(self.thumbnail(layer)),
+            };
+            let depth = doc.depth(index);
             self.list
-                .append(&layer_row(shell, index, layer, &thumbnail));
+                .append(&layer_row(shell, index, depth, layer, thumbnail.as_ref()));
+            rows.push(index);
         }
         // Removing the focused row makes GTK move focus back into the list
         // later, and a row that gains focus that way gets selected. That
@@ -238,11 +251,14 @@ impl LayersPanel {
         }
         self.list.unselect_all();
         for index in doc.selected_indices() {
-            let visual = (doc.layers().len() - 1 - index) as i32;
-            if let Some(row) = self.list.row_at_index(visual) {
+            let Some(visual) = rows.iter().position(|&row| row == index) else {
+                continue;
+            };
+            if let Some(row) = self.list.row_at_index(visual as i32) {
                 self.list.select_row(Some(&row));
             }
         }
+        *self.rows.borrow_mut() = rows;
         let active = doc.active_layer();
         if !self.dragging.get() {
             let opacity = active.map_or(1.0, |layer| layer.opacity) * 100.0;
@@ -256,7 +272,8 @@ impl LayersPanel {
         }
         self.blend
             .set_sensitive(active.is_some_and(|layer| !layer.locked));
-        self.geometry.show(active);
+        self.geometry
+            .show(active.filter(|layer| !matches!(layer.kind, LayerKind::Group { .. })));
         let buttons = self.buttons();
         for button in [&buttons.duplicate, &buttons.up, &buttons.down] {
             button.set_sensitive(active.is_some());
@@ -502,19 +519,49 @@ fn blend_label(mode: BlendMode) -> &'static str {
     }
 }
 
+/// How far each level of grouping indents a row.
+const INDENT: i32 = 16;
+
+/// A layer's row. A group's row has a fold arrow and a folder in place of a
+/// thumbnail, and rows inside groups are indented by `depth`.
 fn layer_row(
     shell: &Rc<Shell>,
     index: usize,
+    depth: usize,
     layer: &Layer,
-    thumbnail: &gdk::Texture,
+    thumbnail: Option<&gdk::Texture>,
 ) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.add_css_class("pixel-layer");
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     content.set_margin_top(4);
     content.set_margin_bottom(4);
-    content.set_margin_start(4);
+    content.set_margin_start(4 + INDENT * depth as i32);
     content.set_margin_end(4);
+    let group = match layer.kind {
+        LayerKind::Group { collapsed } => Some(collapsed),
+        _ => None,
+    };
+    if let Some(collapsed) = group {
+        let fold = gtk::Button::from_icon_name(if collapsed {
+            "pan-end-symbolic"
+        } else {
+            "pan-down-symbolic"
+        });
+        fold.add_css_class("flat");
+        fold.set_valign(gtk::Align::Center);
+        fold.set_tooltip_text(Some(if collapsed {
+            "Show contents"
+        } else {
+            "Hide contents"
+        }));
+        let shell = shell.clone();
+        fold.connect_clicked(move |_| {
+            let shell = shell.clone();
+            glib::idle_add_local_once(move || shell.set_collapsed(index, !collapsed));
+        });
+        content.append(&fold);
+    }
 
     let eye = gtk::ToggleButton::new();
     eye.set_icon_name(if layer.visible {
@@ -645,10 +692,20 @@ fn layer_row(
     });
     row.add_controller(rename_click);
 
-    let picture = gtk::Picture::for_paintable(thumbnail);
+    let picture: gtk::Widget = match thumbnail {
+        Some(thumbnail) => {
+            let picture = gtk::Picture::for_paintable(thumbnail);
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_can_shrink(true);
+            picture.upcast()
+        }
+        None => {
+            let folder = gtk::Image::from_icon_name("folder-symbolic");
+            folder.set_pixel_size(THUMBNAIL_SIZE * 3 / 4);
+            folder.upcast()
+        }
+    };
     picture.set_size_request(THUMBNAIL_SIZE, THUMBNAIL_SIZE);
-    picture.set_content_fit(gtk::ContentFit::Contain);
-    picture.set_can_shrink(true);
     picture.set_can_target(false);
 
     // Rows are as tall as the thumbnail. Keep the toggles their own size.
@@ -675,11 +732,14 @@ fn layer_row(
             return false;
         };
         let shell = shell_drop.clone();
-        glib::idle_add_local_once(move || {
-            shell.edit(Command::Reorder {
-                from: from as usize,
-                to: index,
-            });
+        let from = from as usize;
+        // Dropping onto a group's row puts the layer inside it.
+        glib::idle_add_local_once(move || match group {
+            Some(_) if from != index => shell.edit(Command::MoveIntoGroup {
+                index: from,
+                group: index,
+            }),
+            _ => shell.edit(Command::Reorder { from, to: index }),
         });
         true
     });

@@ -1,6 +1,6 @@
 //! Flatten a document to one RGBA image. Export and the viewport both use this.
 
-use super::{Background, BlendMode, Document};
+use super::{Background, BlendMode, Document, LayerKind};
 use image::{Rgba, RgbaImage};
 
 pub fn composite(doc: &Document) -> RgbaImage {
@@ -19,7 +19,32 @@ pub fn composite_with(doc: &Document, overrides: Option<&[LayerOverride]>) -> Rg
             }
         }
     }
-    for (index, layer) in doc.layers.iter().enumerate() {
+    draw_range(&mut out, doc, 0..doc.layers.len(), overrides);
+    out
+}
+
+/// Draw the layers in `range`, bottom to top. Each group in it draws its
+/// contents. A group at full opacity in Normal mode lets them mix straight
+/// into what is below, as Photoshop's pass-through does. Otherwise they are
+/// flattened on their own first, and the result mixes in with the group's
+/// opacity and blend mode.
+fn draw_range(
+    out: &mut RgbaImage,
+    doc: &Document,
+    range: std::ops::Range<usize>,
+    overrides: Option<&[LayerOverride]>,
+) {
+    // Walk down from the top, one block at a time, then draw bottom up.
+    let mut items = Vec::new();
+    let mut top = range.end;
+    while top > range.start {
+        let block = doc.block(top - 1);
+        let start = block.start.max(range.start);
+        items.push((start, top - 1));
+        top = start;
+    }
+    for (start, index) in items.into_iter().rev() {
+        let layer = &doc.layers[index];
         let replacement = overrides.and_then(|list| list.iter().find(|item| item.index == index));
         let (x, y, opacity, visible) = replacement
             .map(|item| (item.x, item.y, item.opacity, item.visible))
@@ -27,12 +52,21 @@ pub fn composite_with(doc: &Document, overrides: Option<&[LayerOverride]>) -> Rg
         if !visible || opacity <= 0.0 {
             continue;
         }
+        if let LayerKind::Group { .. } = layer.kind {
+            if opacity >= 1.0 && layer.blend == BlendMode::Normal {
+                draw_range(out, doc, start..index, overrides);
+            } else {
+                let mut contents = RgbaImage::new(out.width(), out.height());
+                draw_range(&mut contents, doc, start..index, overrides);
+                blit(out, &contents, 0, 0, opacity, layer.blend);
+            }
+            continue;
+        }
         let pixels = replacement
             .and_then(|item| item.pixels.as_ref())
             .unwrap_or(&layer.pixels);
-        blit(&mut out, pixels, x, y, opacity, layer.blend);
+        blit(out, pixels, x, y, opacity, layer.blend);
     }
-    out
 }
 
 /// The listed layers flattened on their own, without the canvas background,
@@ -40,8 +74,9 @@ pub fn composite_with(doc: &Document, overrides: Option<&[LayerOverride]>) -> Rg
 /// canvas. Copying a selection uses this.
 pub fn composite_layers(doc: &Document, indices: &[usize]) -> Option<RgbaImage> {
     let mut out = RgbaImage::new(doc.width, doc.height);
+    let indices = doc.with_contents(indices);
     for (index, layer) in doc.layers.iter().enumerate() {
-        if indices.contains(&index) && layer.visible && layer.opacity > 0.0 {
+        if indices.contains(&index) && doc.shown(index) && layer.opacity > 0.0 {
             blit(
                 &mut out,
                 &layer.pixels,
