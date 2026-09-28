@@ -1,5 +1,6 @@
 //! A layered raster document and the undoable commands that edit it.
 
+mod arrange;
 mod composite;
 mod handles;
 mod io;
@@ -90,6 +91,17 @@ pub enum QuarterTurn {
 pub enum Axis {
     Horizontal,
     Vertical,
+}
+
+/// Which edges or centers [`Command::AlignLayers`] lines up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    Left,
+    HorizontalCenter,
+    Right,
+    Top,
+    VerticalCenter,
+    Bottom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +425,20 @@ pub enum Command {
         dx: i32,
         dy: i32,
     },
+    /// Line up the visible pixels of the listed layers. One layer lines up
+    /// with the canvas, and several with the box around them all. Locked and
+    /// empty layers are left alone.
+    AlignLayers {
+        indices: Vec<usize>,
+        to: Alignment,
+    },
+    /// Even out the gaps between the listed layers' visible pixels along
+    /// `axis`, keeping the outermost two in place. Horizontal spaces them
+    /// left to right. Locked and empty layers are left alone.
+    DistributeLayers {
+        indices: Vec<usize>,
+        axis: Axis,
+    },
     Crop {
         x: i32,
         y: i32,
@@ -684,6 +710,12 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             }
             Ok(!indices.is_empty() && (*dx != 0 || *dy != 0))
         }
+        Command::AlignLayers { indices, to } => {
+            Ok(!arrange::align_shifts(doc, indices, *to)?.is_empty())
+        }
+        Command::DistributeLayers { indices, axis } => {
+            Ok(!arrange::distribute_shifts(doc, indices, *axis)?.is_empty())
+        }
         Command::Reorder { from, to } => {
             if *from >= doc.layers.len() || *to >= doc.layers.len() {
                 return Err(Error::BadLayer);
@@ -774,6 +806,15 @@ fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
     Ok(())
 }
 
+fn shift_layers(doc: &mut Document, shifts: Vec<arrange::Shift>) -> Result<(), Error> {
+    for (index, dx, dy) in shifts {
+        let layer = doc.layer_mut(index)?;
+        layer.x += dx;
+        layer.y += dy;
+    }
+    Ok(())
+}
+
 fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
     match command {
         Command::AddLayer => {
@@ -857,6 +898,14 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
                 layer.x += dx;
                 layer.y += dy;
             }
+        }
+        Command::AlignLayers { indices, to } => {
+            let shifts = arrange::align_shifts(doc, &indices, to)?;
+            shift_layers(doc, shifts)?;
+        }
+        Command::DistributeLayers { indices, axis } => {
+            let shifts = arrange::distribute_shifts(doc, &indices, axis)?;
+            shift_layers(doc, shifts)?;
         }
         Command::Crop {
             x,
@@ -1351,6 +1400,35 @@ mod tests {
             .apply(Command::DeleteLayers { indices: vec![1] })
             .unwrap();
         assert_eq!(editor.document().active_index(), Some(0));
+    }
+
+    #[test]
+    fn aligning_is_one_undo_step_and_leaves_locked_layers_in_place() {
+        let mut editor = three_layers();
+        editor
+            .apply(Command::SetLocked {
+                index: 0,
+                locked: true,
+            })
+            .unwrap();
+        let positions = |editor: &Editor| -> Vec<(i32, i32)> {
+            editor.doc.layers.iter().map(|layer| (layer.x, layer.y)).collect()
+        };
+        editor
+            .apply(Command::AlignLayers {
+                indices: vec![0, 1, 2],
+                to: Alignment::Right,
+            })
+            .unwrap();
+        assert_eq!(positions(&editor), vec![(0, 0), (5, 1), (5, 5)]);
+        assert!(!editor
+            .apply(Command::AlignLayers {
+                indices: vec![1, 2],
+                to: Alignment::Right,
+            })
+            .unwrap());
+        editor.undo();
+        assert_eq!(positions(&editor), vec![(0, 0), (1, 1), (5, 5)]);
     }
 
     #[test]

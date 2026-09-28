@@ -14,8 +14,8 @@ use image::ImageReader;
 use libadwaita::prelude::*;
 use pixel::document::{
     clockwise_delta, export, hit_handle, open_image, open_project, pointer_angle, resize_rect,
-    save_project, snap_angle, Axis, Command, Document, Editor, ExportFormat, Handle, NewCanvas,
-    PixelRect, QuarterTurn, ScaleFilter, HANDLE_RADIUS, ROTATE_OFFSET,
+    save_project, snap_angle, Alignment, Axis, Command, Document, Editor, ExportFormat, Handle,
+    NewCanvas, PixelRect, QuarterTurn, ScaleFilter, HANDLE_RADIUS, ROTATE_OFFSET,
 };
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -405,6 +405,16 @@ impl Shell {
                 });
             }
         });
+        for (name, to) in ALIGNMENTS {
+            self.add_action(name, &[], move |shell| {
+                shell.arrange(|indices| Command::AlignLayers { indices, to })
+            });
+        }
+        for (name, axis) in DISTRIBUTIONS {
+            self.add_action(name, &[], move |shell| {
+                shell.arrange(|indices| Command::DistributeLayers { indices, axis })
+            });
+        }
         self.add_action("raise", &[], |shell| shell.reorder_active(1));
         self.add_action("lower", &[], |shell| shell.reorder_active(-1));
         self.add_action("fit", &["<primary>0"], |shell| shell.zoom_fit());
@@ -495,6 +505,20 @@ impl Shell {
         };
         if changed {
             self.refresh();
+        }
+    }
+
+    /// Run an align or distribute command on the selection.
+    fn arrange(self: &Rc<Self>, command: impl FnOnce(Vec<usize>) -> Command) {
+        let indices = self
+            .model
+            .borrow()
+            .session
+            .as_ref()
+            .map(|session| movable_selection(session.editor.document()))
+            .unwrap_or_default();
+        if !indices.is_empty() {
+            self.edit(command(indices));
         }
     }
 
@@ -598,6 +622,13 @@ impl Shell {
                 self.enable(name, active.is_some());
             }
             self.enable("delete-layer", !doc.selected_indices().is_empty());
+            let movable = movable_selection(doc).len();
+            for (name, _) in ALIGNMENTS {
+                self.enable(name, movable >= 1);
+            }
+            for (name, _) in DISTRIBUTIONS {
+                self.enable(name, movable >= 3);
+            }
             let editable = active.is_some_and(|layer| !layer.locked);
             for name in ["rotate-layer", "flip-layer-h", "flip-layer-v"] {
                 self.enable(name, editable);
@@ -656,6 +687,14 @@ impl Shell {
             "flip-layer-v",
             "raise",
             "lower",
+            "align-left",
+            "align-horizontal-center",
+            "align-right",
+            "align-top",
+            "align-vertical-center",
+            "align-bottom",
+            "distribute-horizontal",
+            "distribute-vertical",
             "fit",
             "actual",
             "tool-select",
@@ -1604,6 +1643,7 @@ fn install_theme(shell: &Rc<Shell>) {
     };
     apply();
     if let Some(display) = gdk::Display::default() {
+        gtk::IconTheme::for_display(&display).add_resource_path("/app/pixel/Pixel/icons");
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
@@ -1698,6 +1738,28 @@ fn app_menu() -> gio::Menu {
         menu.append(Some("Lower"), Some("win.lower"));
         menu
     });
+    menu.append_submenu(Some("Selection"), &{
+        let menu = gio::Menu::new();
+        menu.append_item(&icon_row(
+            "Align",
+            &[
+                ("Align Top Edges", "align-top"),
+                ("Align Vertical Centers", "align-vertical-center"),
+                ("Align Bottom Edges", "align-bottom"),
+                ("Align Left Edges", "align-left"),
+                ("Align Horizontal Centers", "align-horizontal-center"),
+                ("Align Right Edges", "align-right"),
+            ],
+        ));
+        menu.append_item(&icon_row(
+            "Distribute",
+            &[
+                ("Distribute Horizontally", "distribute-horizontal"),
+                ("Distribute Vertically", "distribute-vertical"),
+            ],
+        ));
+        menu
+    });
     menu.append_submenu(Some("View"), &{
         let menu = gio::Menu::new();
         menu.append(Some("Fit"), Some("win.fit"));
@@ -1708,6 +1770,40 @@ fn app_menu() -> gio::Menu {
         menu
     });
     menu
+}
+
+/// Align actions. A single layer aligns to the canvas.
+const ALIGNMENTS: [(&str, Alignment); 6] = [
+    ("align-left", Alignment::Left),
+    ("align-horizontal-center", Alignment::HorizontalCenter),
+    ("align-right", Alignment::Right),
+    ("align-top", Alignment::Top),
+    ("align-vertical-center", Alignment::VerticalCenter),
+    ("align-bottom", Alignment::Bottom),
+];
+
+/// Distribute actions. They need three movable layers.
+const DISTRIBUTIONS: [(&str, Axis); 2] = [
+    ("distribute-horizontal", Axis::Horizontal),
+    ("distribute-vertical", Axis::Vertical),
+];
+
+/// A titled menu section drawn as one row of icon buttons. Each action's icon
+/// is `pixel-<action>-symbolic`, and its label is the tooltip.
+fn icon_row(title: &str, items: &[(&str, &str)]) -> gio::MenuItem {
+    let row = gio::Menu::new();
+    for (label, action) in items {
+        let item = gio::MenuItem::new(Some(label), Some(&format!("win.{action}")));
+        item.set_attribute_value(
+            "verb-icon",
+            Some(&format!("pixel-{action}-symbolic").to_variant()),
+        );
+        item.set_attribute_value("tooltip", Some(&label.to_variant()));
+        row.append_item(&item);
+    }
+    let section = gio::MenuItem::new_section(Some(title), &row);
+    section.set_attribute_value("display-hint", Some(&"horizontal-buttons".to_variant()));
+    section
 }
 
 fn tool_button(label: &str) -> gtk::ToggleButton {

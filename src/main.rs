@@ -4,6 +4,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 fn main() -> glib::ExitCode {
+    gio::resources_register_include!("pixel.gresource").expect("the bundled icons are valid");
     let app = libadwaita::Application::builder()
         .application_id("app.pixel.Pixel")
         .flags(gio::ApplicationFlags::HANDLES_OPEN)

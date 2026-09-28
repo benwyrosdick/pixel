@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/app/pixel/Pixel/icons/scalable/actions">
+    <file>pixel-align-top-symbolic.svg</file>
+    <file>pixel-align-vertical-center-symbolic.svg</file>
+    <file>pixel-align-bottom-symbolic.svg</file>
+    <file>pixel-align-left-symbolic.svg</file>
+    <file>pixel-align-horizontal-center-symbolic.svg</file>
+    <file>pixel-align-right-symbolic.svg</file>
+    <file>pixel-distribute-horizontal-symbolic.svg</file>
+    <file>pixel-distribute-vertical-symbolic.svg</file>
+  </gresource>
+</gresources>
