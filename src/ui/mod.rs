@@ -3,6 +3,7 @@ mod dialogs;
 mod layers;
 mod model;
 mod shell;
+mod snap;
 mod theme;
 
 use std::path::PathBuf;

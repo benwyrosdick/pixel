@@ -45,6 +45,11 @@ The window reads `~/.local/state/omarchy/current/theme/colors.toml` and follows 
 | Delete the selected layers | Delete or Backspace |
 | Duplicate layer | Ctrl+J |
 | Raise / lower layer | Ctrl+] / Ctrl+[ |
+| Show rulers / guides | Ctrl+R / Ctrl+; |
+| Snapping on or off | Ctrl+Shift+; |
+| Skip snapping for one drag | Hold Ctrl |
+
+Dragging a layer or a resize handle snaps its edges and centre to the canvas, to what other layers draw, and to guides, with a pink line showing what it snapped to. Drag out of a ruler to add a guide, drag a guide to move it, and drag it back onto its ruler to remove it. Guides are saved in the project. The Position and size fields under the layers set the selected layer's exact box.
 
 Image ▸ Trim to Content crops the canvas to the pixels the visible layers draw, ignoring the canvas background. File ▸ Open Recent and the welcome screen list the files Pixel opened or saved recently.
 

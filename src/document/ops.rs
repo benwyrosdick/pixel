@@ -1,7 +1,7 @@
 //! Geometry and pixel transforms. Each function mutates the document in place.
 //! Callers snapshot the document for undo before calling.
 
-use super::{Anchor, Axis, Document, Error, QuarterTurn};
+use super::{Anchor, Axis, Document, Error, Guides, QuarterTurn};
 use image::imageops::{self, FilterType};
 use image::{Rgba, RgbaImage};
 use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
@@ -58,9 +58,15 @@ pub fn crop(doc: &mut Document, x: i32, y: i32, width: u32, height: u32) -> Resu
         layer.x = ix0 - x0;
         layer.y = iy0 - y0;
     }
+    shift_guides(doc, -x0, -y0);
     doc.width = (x1 - x0) as u32;
     doc.height = (y1 - y0) as u32;
     Ok(())
+}
+
+fn shift_guides(doc: &mut Document, dx: i32, dy: i32) {
+    doc.guides.x.iter_mut().for_each(|x| *x += dx);
+    doc.guides.y.iter_mut().for_each(|y| *y += dy);
 }
 
 pub fn resize_canvas(
@@ -78,6 +84,7 @@ pub fn resize_canvas(
         layer.x += dx;
         layer.y += dy;
     }
+    shift_guides(doc, dx, dy);
     doc.width = width;
     doc.height = height;
     Ok(())
@@ -136,6 +143,12 @@ pub fn scale_document(
         layer.x = (layer.x as f64 * sx).round() as i32;
         layer.y = (layer.y as f64 * sy).round() as i32;
     }
+    for x in &mut doc.guides.x {
+        *x = (*x as f64 * sx).round() as i32;
+    }
+    for y in &mut doc.guides.y {
+        *y = (*y as f64 * sy).round() as i32;
+    }
     doc.width = width;
     doc.height = height;
     Ok(())
@@ -186,6 +199,24 @@ pub fn rotate_canvas(doc: &mut Document, turn: QuarterTurn) {
         layer.x = nx;
         layer.y = ny;
     }
+    // A point (x, y) lands at (h - y, x) clockwise and (y, w - x) the other
+    // way, so each guide turns into one along the other axis.
+    let (w, h) = (width as i32, height as i32);
+    let guides = std::mem::take(&mut doc.guides);
+    doc.guides = match turn {
+        QuarterTurn::Cw => Guides {
+            x: guides.y.iter().map(|y| h - y).collect(),
+            y: guides.x,
+        },
+        QuarterTurn::Ccw => Guides {
+            x: guides.y,
+            y: guides.x.iter().map(|x| w - x).collect(),
+        },
+        QuarterTurn::Half => Guides {
+            x: guides.x.iter().map(|x| w - x).collect(),
+            y: guides.y.iter().map(|y| h - y).collect(),
+        },
+    };
     match turn {
         QuarterTurn::Cw | QuarterTurn::Ccw => {
             doc.width = height;
@@ -214,6 +245,14 @@ pub fn flip_canvas(doc: &mut Document, axis: Axis) {
                 layer.y = height as i32 - y - h;
             }
         }
+    }
+    match axis {
+        Axis::Horizontal => doc.guides.x.iter_mut().for_each(|x| *x = width as i32 - *x),
+        Axis::Vertical => doc
+            .guides
+            .y
+            .iter_mut()
+            .for_each(|y| *y = height as i32 - *y),
     }
 }
 

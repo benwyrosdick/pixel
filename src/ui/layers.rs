@@ -1,11 +1,11 @@
-//! The layer list, opacity slider, and layer buttons.
+//! The layer list, opacity slider, position and size fields, and layer buttons.
 
 use super::model::Session;
 use super::shell::Shell;
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
-use pixel::document::{Command, Layer};
+use pixel::document::{Command, Layer, PixelRect, MAX_EDGE};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -13,6 +13,7 @@ pub struct LayersPanel {
     pub root: gtk::Box,
     list: gtk::ListBox,
     opacity: gtk::Scale,
+    geometry: Geometry,
     updating: Rc<Cell<bool>>,
     dragging: Rc<Cell<bool>>,
     opacity_before: Rc<Cell<f32>>,
@@ -71,10 +72,20 @@ impl LayersPanel {
         root.append(&gtk::Label::builder().label("Opacity").xalign(0.0).build());
         root.append(&opacity);
 
+        let geometry = Geometry::new();
+        root.append(
+            &gtk::Label::builder()
+                .label("Position and size")
+                .xalign(0.0)
+                .build(),
+        );
+        root.append(&geometry.grid);
+
         let panel = Self {
             root,
             list,
             opacity,
+            geometry,
             updating: Rc::new(Cell::new(false)),
             dragging: Rc::new(Cell::new(false)),
             opacity_before: Rc::new(Cell::new(1.0)),
@@ -164,6 +175,8 @@ impl LayersPanel {
                 shell_change.commit_opacity(opacity);
             }
         });
+
+        self.geometry.connect(shell, &self.updating);
     }
 
     pub fn sync(&self, shell: &Rc<Shell>, session: &Session) {
@@ -200,6 +213,7 @@ impl LayersPanel {
         }
         self.opacity
             .set_sensitive(active.is_some_and(|layer| !layer.locked));
+        self.geometry.show(active);
         let buttons = self.buttons();
         for button in [&buttons.duplicate, &buttons.up, &buttons.down] {
             button.set_sensitive(active.is_some());
@@ -244,6 +258,118 @@ fn show_lock(button: &gtk::ToggleButton, locked: bool) {
         button.set_icon_name("changes-allow-symbolic");
         button.set_tooltip_text(Some("Lock layer"));
         button.set_opacity(0.45);
+    }
+}
+
+/// X, Y, width, and height fields for the one selected layer, with a toggle
+/// that keeps the aspect ratio while the size changes.
+struct Geometry {
+    grid: gtk::Grid,
+    x: gtk::SpinButton,
+    y: gtk::SpinButton,
+    width: gtk::SpinButton,
+    height: gtk::SpinButton,
+    keep_aspect: gtk::ToggleButton,
+}
+
+impl Geometry {
+    fn new() -> Self {
+        let reach = MAX_EDGE as f64 * 4.0;
+        let field = |min: f64, max: f64, tooltip: &str| {
+            let spin = gtk::SpinButton::with_range(min, max, 1.0);
+            spin.set_digits(0);
+            spin.set_numeric(true);
+            spin.set_width_chars(5);
+            spin.set_hexpand(true);
+            spin.set_tooltip_text(Some(tooltip));
+            spin
+        };
+        let x = field(-reach, reach, "Left edge, in pixels");
+        let y = field(-reach, reach, "Top edge, in pixels");
+        let width = field(1.0, MAX_EDGE as f64, "Width, in pixels");
+        let height = field(1.0, MAX_EDGE as f64, "Height, in pixels");
+        let keep_aspect = gtk::ToggleButton::new();
+        keep_aspect.set_icon_name("insert-link-symbolic");
+        keep_aspect.set_tooltip_text(Some("Keep the aspect ratio"));
+        keep_aspect.set_valign(gtk::Align::Center);
+
+        let grid = gtk::Grid::new();
+        grid.set_row_spacing(4);
+        grid.set_column_spacing(6);
+        let label = |text: &str| gtk::Label::builder().label(text).xalign(0.0).build();
+        grid.attach(&label("X"), 0, 0, 1, 1);
+        grid.attach(&x, 1, 0, 1, 1);
+        grid.attach(&label("Y"), 2, 0, 1, 1);
+        grid.attach(&y, 3, 0, 1, 1);
+        grid.attach(&label("W"), 0, 1, 1, 1);
+        grid.attach(&width, 1, 1, 1, 1);
+        grid.attach(&label("H"), 2, 1, 1, 1);
+        grid.attach(&height, 3, 1, 1, 1);
+        grid.attach(&keep_aspect, 4, 1, 1, 1);
+        Self {
+            grid,
+            x,
+            y,
+            width,
+            height,
+            keep_aspect,
+        }
+    }
+
+    fn connect(&self, shell: &Rc<Shell>, updating: &Rc<Cell<bool>>) {
+        let fields = [&self.x, &self.y, &self.width, &self.height];
+        for (field, sized) in fields
+            .into_iter()
+            .zip([None, None, Some(true), Some(false)])
+        {
+            let shell = shell.clone();
+            let updating = updating.clone();
+            let (x, y, width, height) = (
+                self.x.clone(),
+                self.y.clone(),
+                self.width.clone(),
+                self.height.clone(),
+            );
+            let keep_aspect = self.keep_aspect.clone();
+            field.connect_value_changed(move |_| {
+                if updating.get() {
+                    return;
+                }
+                let Some(current) = shell.active_geometry() else {
+                    return;
+                };
+                // Carry the size change to the other side, in proportion.
+                if let (Some(changed_width), true) = (sized, keep_aspect.is_active()) {
+                    let ratio = current.height as f64 / current.width as f64;
+                    updating.set(true);
+                    if changed_width {
+                        height.set_value((width.value() * ratio).round().max(1.0));
+                    } else {
+                        width.set_value((height.value() / ratio).round().max(1.0));
+                    }
+                    updating.set(false);
+                }
+                shell.set_active_geometry(PixelRect {
+                    x: x.value() as i32,
+                    y: y.value() as i32,
+                    width: width.value() as u32,
+                    height: height.value() as u32,
+                });
+            });
+        }
+    }
+
+    /// Show the selected layer's box. The fields grey out unless exactly one
+    /// unlocked layer is selected.
+    fn show(&self, active: Option<&Layer>) {
+        if let Some(layer) = active {
+            self.x.set_value(layer.x as f64);
+            self.y.set_value(layer.y as f64);
+            self.width.set_value(layer.width() as f64);
+            self.height.set_value(layer.height() as f64);
+        }
+        self.grid
+            .set_sensitive(active.is_some_and(|layer| !layer.locked));
     }
 }
 

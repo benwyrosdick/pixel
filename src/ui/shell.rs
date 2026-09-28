@@ -1,12 +1,13 @@
 //! The editor window. Document changes go through [`Shell::edit`].
 
-use super::canvas::{upload, Canvas, CanvasInput};
+use super::canvas::{upload, Canvas, CanvasInput, RULER_SIZE};
 use super::dialogs;
 use super::layers::LayersPanel;
 use super::model::{
     active_bounds, doc_to_widget, document_title, fit_view, jpeg_needs_white, layer_bounds,
-    widget_to_doc, CropDraft, Model, Preview, Tool,
+    widget_to_doc, CropDraft, GuideDraft, Model, Preview, SnapLine, Tool,
 };
+use super::snap::{moving_bounds, snap_lines, x_lines, y_lines, SnapTargets, SNAP_DISTANCE};
 use super::theme::{self, ThemeColors};
 use gtk::gdk;
 use gtk::{gio, glib, prelude::*};
@@ -15,8 +16,8 @@ use libadwaita::prelude::*;
 use pixel::document::{
     clockwise_delta, composite, composite_layers, export, hit_handle, open_image, open_project,
     pointer_angle, resize_rect, save_project, snap_angle, Alignment, Axis, Command, Document,
-    Editor, ExportFormat, Handle, NewCanvas, PixelRect, QuarterTurn, ScaleFilter, HANDLE_RADIUS,
-    ROTATE_OFFSET,
+    Editor, ExportFormat, Guides, Handle, NewCanvas, PixelRect, QuarterTurn, ScaleFilter,
+    HANDLE_RADIUS, ROTATE_OFFSET,
 };
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -69,6 +70,15 @@ enum DragKind {
     },
     Move {
         indices: Vec<usize>,
+        /// What the moving layers draw, where the drag began.
+        bounds: Option<PixelRect>,
+        targets: SnapTargets,
+    },
+    /// A guide dragged out of a ruler, or an existing one being moved.
+    Guide {
+        vertical: bool,
+        from: Option<usize>,
+        targets: SnapTargets,
     },
     /// A select-tool press. It becomes a drag box once the pointer travels.
     Select {
@@ -79,6 +89,7 @@ enum DragKind {
         index: usize,
         handle: Handle,
         origin: PixelRect,
+        targets: SnapTargets,
     },
     Rotate {
         index: usize,
@@ -124,6 +135,11 @@ impl Shell {
             session: None,
             accent: colors.accent_rgb,
             background: colors.background_rgb,
+            chrome: colors.chrome_rgb(),
+            chrome_text: colors.chrome_text_rgb(),
+            show_rulers: true,
+            show_guides: true,
+            snap: true,
         }));
 
         let canvas = Canvas::new();
@@ -478,6 +494,20 @@ impl Shell {
         });
         self.add_action("fit", &["<primary>0"], |shell| shell.zoom_fit());
         self.add_action("actual", &["<primary>1"], |shell| shell.zoom_actual());
+        self.add_toggle("show-rulers", &["<primary>r"], true, |model, on| {
+            model.show_rulers = on
+        });
+        self.add_toggle("show-guides", &["<primary>semicolon"], true, |model, on| {
+            model.show_guides = on
+        });
+        self.add_toggle("snap", &["<primary><shift>semicolon"], true, |model, on| {
+            model.snap = on
+        });
+        self.add_action("clear-guides", &[], |shell| {
+            shell.edit(Command::SetGuides {
+                guides: Guides::default(),
+            })
+        });
         self.add_action("zoom-in", &[], |shell| shell.zoom_step(ZOOM_STEP));
         self.add_action("zoom-out", &[], |shell| shell.zoom_step(1.0 / ZOOM_STEP));
         self.add_action("tool-select", &[], |shell| shell.set_tool(Tool::Select));
@@ -562,6 +592,51 @@ impl Shell {
         });
     }
 
+    fn view(&self) -> View {
+        let model = self.model.borrow();
+        View {
+            rulers: model.show_rulers,
+            guides: model.show_guides,
+            snap: model.snap,
+            width: self.canvas.width() as f64,
+            height: self.canvas.height() as f64,
+        }
+    }
+
+    /// A View menu checkbox. `apply` receives the new state.
+    fn add_toggle(
+        self: &Rc<Self>,
+        name: &str,
+        accels: &[&str],
+        initial: bool,
+        apply: impl Fn(&mut Model, bool) + 'static,
+    ) {
+        let action = gio::SimpleAction::new_stateful(name, None, &initial.to_variant());
+        let shell = self.clone();
+        action.connect_activate(move |action, _| {
+            let on = !action
+                .state()
+                .and_then(|state| state.get::<bool>())
+                .unwrap_or(false);
+            action.set_state(&on.to_variant());
+            apply(&mut shell.model.borrow_mut(), on);
+            shell.canvas.queue_draw();
+        });
+        self.window.add_action(&action);
+        if let Some(app) = self.window.application() {
+            app.set_accels_for_action(&format!("win.{name}"), accels);
+        }
+    }
+
+    /// Show a checkbox's state without running its action.
+    fn set_toggle(&self, name: &str, on: bool) {
+        if let Some(action) = self.window.lookup_action(name) {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_state(&on.to_variant());
+            }
+        }
+    }
+
     fn add_action(self: &Rc<Self>, name: &str, accels: &[&str], f: impl Fn(&Rc<Shell>) + 'static) {
         let action = gio::SimpleAction::new(name, None);
         let shell = self.clone();
@@ -610,6 +685,41 @@ impl Shell {
         };
         if changed {
             self.refresh();
+        }
+    }
+
+    /// The one selected layer's box, for the position and size fields.
+    pub fn active_geometry(&self) -> Option<PixelRect> {
+        let model = self.model.borrow();
+        let layer = model.session.as_ref()?.editor.document().active_layer()?;
+        Some(PixelRect {
+            x: layer.x,
+            y: layer.y,
+            width: layer.width(),
+            height: layer.height(),
+        })
+    }
+
+    /// Put the one selected layer in `rect`, resampling it if the size changed.
+    pub fn set_active_geometry(self: &Rc<Self>, rect: PixelRect) {
+        let (Some(index), Some(current)) = (self.active_index(), self.active_geometry()) else {
+            return;
+        };
+        if (rect.width, rect.height) == (current.width, current.height) {
+            self.edit(Command::MoveLayer {
+                index,
+                x: rect.x,
+                y: rect.y,
+            });
+        } else {
+            self.edit(Command::ScaleLayer {
+                index,
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                filter: ScaleFilter::Lanczos3,
+            });
         }
     }
 
@@ -926,6 +1036,7 @@ impl Shell {
             "actual",
             "zoom-in",
             "zoom-out",
+            "clear-guides",
             "cut",
             "copy",
             "copy-image",
@@ -1025,9 +1136,10 @@ impl Shell {
     fn show_document(self: &Rc<Self>, editor: Editor, path: Option<PathBuf>) {
         self.model.borrow_mut().open_editor(editor, path);
         let (width, height) = (self.canvas.width(), self.canvas.height());
+        let inset = self.view().inset();
         if width > 1 && height > 1 {
             if let Some(session) = self.model.borrow_mut().session.as_mut() {
-                fit_view(session, width, height);
+                fit_view(session, width, height, inset);
                 session.fit_pending = false;
             }
         }
@@ -1495,19 +1607,21 @@ impl Shell {
 
     fn zoom_fit(self: &Rc<Self>) {
         let (width, height) = (self.canvas.width(), self.canvas.height());
+        let inset = self.view().inset();
         if let Some(session) = self.model.borrow_mut().session.as_mut() {
-            fit_view(session, width, height);
+            fit_view(session, width, height, inset);
         }
         self.refresh();
     }
 
     fn zoom_actual(self: &Rc<Self>) {
         let (width, height) = (self.canvas.width() as f64, self.canvas.height() as f64);
+        let inset = self.view().inset();
         if let Some(session) = self.model.borrow_mut().session.as_mut() {
             let doc = session.editor.document();
             session.zoom = 1.0;
-            session.pan_x = width / 2.0 - doc.width as f64 / 2.0;
-            session.pan_y = height / 2.0 - doc.height as f64 / 2.0;
+            session.pan_x = inset + (width - inset - doc.width as f64) / 2.0;
+            session.pan_y = inset + (height - inset - doc.height as f64) / 2.0;
         }
         self.refresh();
     }
@@ -1622,8 +1736,9 @@ impl Shell {
                     .as_ref()
                     .is_some_and(|session| session.fit_pending);
                 if pending && width > 1 && height > 1 {
+                    let inset = self.view().inset();
                     if let Some(session) = self.model.borrow_mut().session.as_mut() {
-                        fit_view(session, width, height);
+                        fit_view(session, width, height, inset);
                         session.fit_pending = false;
                     }
                     self.refresh();
@@ -1638,12 +1753,13 @@ impl Shell {
             }
             CanvasInput::Scroll { x, y, dy } => self.zoom_wheel(x, y, dy),
             CanvasInput::DragBegin { x, y, button } => self.begin_drag(x, y, button),
-            CanvasInput::DragUpdate { x, y, shift } => self.update_drag(x, y, shift),
-            CanvasInput::DragEnd { x, y, shift } => self.end_drag(x, y, shift),
+            CanvasInput::DragUpdate { x, y, shift, ctrl } => self.update_drag(x, y, shift, ctrl),
+            CanvasInput::DragEnd { x, y, shift, ctrl } => self.end_drag(x, y, shift, ctrl),
         }
     }
 
     fn track_cursor(&self, x: f64, y: f64) {
+        let view = self.view();
         let (text, cursor) = {
             let mut model = self.model.borrow_mut();
             let Some(session) = model.session.as_mut() else {
@@ -1657,12 +1773,16 @@ impl Shell {
                 } else {
                     None
                 };
-            let cursor = hover_cursor(session, x, y);
+            let cursor = hover_cursor(session, view, x, y);
             (cursor_text(session.cursor), cursor)
         };
         self.status_cursor.set_label(&text);
         if let Some(cursor) = cursor {
             self.canvas.set_cursor_from_name(Some(cursor));
+        }
+        if view.rulers {
+            // Moves the pointer mark along the rulers.
+            self.canvas.queue_draw();
         }
     }
 
@@ -1694,10 +1814,12 @@ impl Shell {
     }
 
     fn begin_drag(self: &Rc<Self>, x: f64, y: f64, button: u32) {
+        let view = self.view();
         let mut model = self.model.borrow_mut();
         let Some(session) = model.session.as_mut() else {
             return;
         };
+        session.snap_lines.clear();
         if button == gdk::BUTTON_MIDDLE || session.space_down {
             let drag = Drag {
                 kind: DragKind::Pan {
@@ -1714,6 +1836,43 @@ impl Shell {
         if button != gdk::BUTTON_PRIMARY {
             return;
         }
+        if view.rulers && x < RULER_SIZE && y < RULER_SIZE {
+            return;
+        }
+        if let Some((vertical, from)) = guide_pickup(session, view, x, y) {
+            let doc = session.editor.document();
+            let targets = SnapTargets::collect(doc, &[], false);
+            let (px, py) = widget_to_doc(session, x, y);
+            let position = match from {
+                Some(index) if vertical => doc.guides().x[index] as f64,
+                Some(index) => doc.guides().y[index] as f64,
+                None if vertical => px.round(),
+                None => py.round(),
+            };
+            session.guide_draft = Some(GuideDraft {
+                vertical,
+                position,
+                from,
+                removing: from.is_none(),
+            });
+            // A guide pulled out while guides are hidden brings them back.
+            model.show_guides = true;
+            drop(model);
+            if !view.guides {
+                self.set_toggle("show-guides", true);
+            }
+            *self.drag.borrow_mut() = Some(Drag {
+                kind: DragKind::Guide {
+                    vertical,
+                    from,
+                    targets,
+                },
+                origin_x: x,
+                origin_y: y,
+            });
+            self.canvas.queue_draw();
+            return;
+        }
         let mut selected = false;
         let drag = match session.tool {
             Tool::Select => {
@@ -1726,7 +1885,7 @@ impl Shell {
             }
             Tool::Move => {
                 selected = select_under_pointer(session, x, y);
-                let Some(kind) = move_drag(session, x, y) else {
+                let Some(kind) = move_drag(session, x, y, view.guides) else {
                     drop(model);
                     if selected {
                         self.refresh();
@@ -1755,10 +1914,12 @@ impl Shell {
         }
     }
 
-    fn update_drag(self: &Rc<Self>, x: f64, y: f64, shift: bool) {
+    fn update_drag(self: &Rc<Self>, x: f64, y: f64, shift: bool, ctrl: bool) {
         let Some(drag) = self.drag.borrow().clone() else {
             return;
         };
+        let view = self.view();
+        let snap = view.snap && !ctrl;
         match drag.kind {
             DragKind::Pan { pan_x, pan_y } => {
                 if let Some(session) = self.model.borrow_mut().session.as_mut() {
@@ -1771,17 +1932,13 @@ impl Shell {
                 index,
                 handle,
                 origin,
+                targets,
             } => {
-                let rect = {
-                    let model = self.model.borrow();
-                    let Some(session) = model.session.as_ref() else {
-                        return;
-                    };
-                    let (px, py) = widget_to_doc(session, x, y);
-                    resize_rect(origin, handle, px, py, shift)
-                };
                 let mut model = self.model.borrow_mut();
                 if let Some(session) = model.session.as_mut() {
+                    let (rect, lines) =
+                        snapped_resize(session, origin, handle, &targets, x, y, shift, snap);
+                    session.snap_lines = lines;
                     session.preview = Some(Preview::Resize {
                         index,
                         x: rect.x,
@@ -1818,20 +1975,32 @@ impl Shell {
                 drop(model);
                 self.canvas.queue_draw();
             }
-            DragKind::Move { indices } => {
-                let (dx, dy) = {
-                    let model = self.model.borrow();
-                    let Some(session) = model.session.as_ref() else {
-                        return;
-                    };
-                    drag_offset(session, (drag.origin_x, drag.origin_y), x, y)
-                };
+            DragKind::Move {
+                indices,
+                bounds,
+                targets,
+            } => {
                 let mut model = self.model.borrow_mut();
                 if let Some(session) = model.session.as_mut() {
+                    let origin = (drag.origin_x, drag.origin_y);
+                    let (dx, dy, lines) =
+                        snapped_move(session, origin, bounds, &targets, x, y, snap);
+                    session.snap_lines = lines;
                     session.preview = Some(Preview::Move { indices, dx, dy });
                     session.visual = session.visual.wrapping_add(1);
                 }
                 drop(model);
+                self.canvas.queue_draw();
+            }
+            DragKind::Guide {
+                vertical,
+                from,
+                targets,
+            } => {
+                if let Some(session) = self.model.borrow_mut().session.as_mut() {
+                    let draft = guide_draft(session, view, vertical, from, &targets, x, y, snap);
+                    session.guide_draft = Some(draft);
+                }
                 self.canvas.queue_draw();
             }
             DragKind::Select { ax, ay } => {
@@ -1869,23 +2038,61 @@ impl Shell {
         }
     }
 
-    fn end_drag(self: &Rc<Self>, x: f64, y: f64, shift: bool) {
+    fn end_drag(self: &Rc<Self>, x: f64, y: f64, shift: bool, ctrl: bool) {
         let Some(drag) = self.drag.borrow_mut().take() else {
             return;
         };
+        let view = self.view();
+        let snap = view.snap && !ctrl;
+        if let Some(session) = self.model.borrow_mut().session.as_mut() {
+            session.snap_lines.clear();
+        }
         match drag.kind {
-            DragKind::Move { indices } => {
+            DragKind::Move {
+                indices,
+                bounds,
+                targets,
+            } => {
                 let (dx, dy) = {
-                    let model = self.model.borrow();
-                    let Some(session) = model.session.as_ref() else {
+                    let mut model = self.model.borrow_mut();
+                    let Some(session) = model.session.as_mut() else {
                         return;
                     };
-                    drag_offset(session, (drag.origin_x, drag.origin_y), x, y)
-                };
-                if let Some(session) = self.model.borrow_mut().session.as_mut() {
                     session.preview = None;
-                }
+                    let origin = (drag.origin_x, drag.origin_y);
+                    let (dx, dy, _) = snapped_move(session, origin, bounds, &targets, x, y, snap);
+                    (dx, dy)
+                };
                 self.edit(Command::MoveLayers { indices, dx, dy });
+            }
+            DragKind::Guide {
+                vertical,
+                from,
+                targets,
+            } => {
+                let guides = {
+                    let mut model = self.model.borrow_mut();
+                    let Some(session) = model.session.as_mut() else {
+                        return;
+                    };
+                    session.guide_draft = None;
+                    let draft = guide_draft(session, view, vertical, from, &targets, x, y, snap);
+                    let mut guides = session.editor.document().guides().clone();
+                    let list = if vertical {
+                        &mut guides.x
+                    } else {
+                        &mut guides.y
+                    };
+                    if let Some(index) = from {
+                        list.remove(index);
+                    }
+                    let position = draft.position.round() as i32;
+                    if !draft.removing && !list.contains(&position) {
+                        list.push(position);
+                    }
+                    guides
+                };
+                self.edit(Command::SetGuides { guides });
             }
             DragKind::Select { ax, ay } => {
                 if let Some(session) = self.model.borrow_mut().session.as_mut() {
@@ -1897,14 +2104,14 @@ impl Shell {
                 index,
                 handle,
                 origin,
+                targets,
             } => {
                 let rect = {
                     let model = self.model.borrow();
                     let Some(session) = model.session.as_ref() else {
                         return;
                     };
-                    let (px, py) = widget_to_doc(session, x, y);
-                    resize_rect(origin, handle, px, py, shift)
+                    snapped_resize(session, origin, handle, &targets, x, y, shift, snap).0
                 };
                 if let Some(session) = self.model.borrow_mut().session.as_mut() {
                     session.preview = None;
@@ -1959,6 +2166,8 @@ fn install_theme(shell: &Rc<Shell>) {
         let mut model = shell_for_css.model.borrow_mut();
         model.accent = colors.accent_rgb;
         model.background = colors.background_rgb;
+        model.chrome = colors.chrome_rgb();
+        model.chrome_text = colors.chrome_text_rgb();
         drop(model);
         shell_for_css.canvas.queue_draw();
     };
@@ -1984,6 +2193,8 @@ fn install_theme(shell: &Rc<Shell>) {
                 let mut model = watched.model.borrow_mut();
                 model.accent = colors.accent_rgb;
                 model.background = colors.background_rgb;
+                model.chrome = colors.chrome_rgb();
+                model.chrome_text = colors.chrome_text_rgb();
                 drop(model);
                 watched.canvas.queue_draw();
             });
@@ -2200,9 +2411,21 @@ fn app_menu(recent: &gio::Menu) -> gio::Menu {
         menu.append_item(&menu_item("Zoom Out", "zoom-out"));
         menu.append_item(&menu_item("Fit", "fit"));
         menu.append_item(&menu_item("Actual Size", "actual"));
-        menu.append_item(&menu_item("Select Tool", "tool-select"));
-        menu.append_item(&menu_item("Move Tool", "tool-move"));
-        menu.append_item(&menu_item("Crop Tool", "tool-crop"));
+        menu.append_section(None, &{
+            let menu = gio::Menu::new();
+            menu.append_item(&menu_item("Show Rulers", "show-rulers"));
+            menu.append_item(&menu_item("Show Guides", "show-guides"));
+            menu.append_item(&menu_item("Snap", "snap"));
+            menu.append_item(&menu_item("Clear Guides", "clear-guides"));
+            menu
+        });
+        menu.append_section(None, &{
+            let menu = gio::Menu::new();
+            menu.append_item(&menu_item("Select Tool", "tool-select"));
+            menu.append_item(&menu_item("Move Tool", "tool-move"));
+            menu.append_item(&menu_item("Crop Tool", "tool-crop"));
+            menu
+        });
         menu
     });
     menu
@@ -2430,12 +2653,20 @@ fn select_under_pointer(session: &mut super::model::Session, x: f64, y: f64) -> 
 
 /// The drag the move tool starts, or `None` when nothing movable is selected.
 /// Handles only exist when one layer is selected.
-fn move_drag(session: &super::model::Session, x: f64, y: f64) -> Option<DragKind> {
+fn move_drag(session: &super::model::Session, x: f64, y: f64, guides: bool) -> Option<DragKind> {
     let doc = session.editor.document();
     let Some(index) = doc.active_index() else {
         let indices = movable_selection(doc);
-        return (!indices.is_empty()).then_some(DragKind::Move { indices });
+        if indices.is_empty() {
+            return None;
+        }
+        return Some(DragKind::Move {
+            bounds: moving_bounds(doc, &indices),
+            targets: SnapTargets::collect(doc, &indices, guides),
+            indices,
+        });
     };
+    let targets = SnapTargets::collect(doc, &[index], guides);
     let layer = &doc.layers()[index];
     if layer.locked {
         return None;
@@ -2457,9 +2688,12 @@ fn move_drag(session: &super::model::Session, x: f64, y: f64) -> Option<DragKind
             index,
             handle,
             origin: bounds,
+            targets,
         },
         None => DragKind::Move {
             indices: vec![index],
+            bounds: moving_bounds(doc, &[index]),
+            targets,
         },
     };
     Some(kind)
@@ -2514,7 +2748,20 @@ fn hit_at(session: &super::model::Session, x: f64, y: f64) -> Option<Handle> {
     hit_handle(x, y, left, top, right, bottom, HANDLE_RADIUS, ROTATE_OFFSET)
 }
 
-fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'static str> {
+fn hover_cursor(
+    session: &super::model::Session,
+    view: View,
+    x: f64,
+    y: f64,
+) -> Option<&'static str> {
+    if view.rulers && (x < RULER_SIZE || y < RULER_SIZE) {
+        return Some("default");
+    }
+    if !session.space_down {
+        if let Some((vertical, Some(_))) = guide_pickup(session, view, x, y) {
+            return Some(if vertical { "ew-resize" } else { "ns-resize" });
+        }
+    }
     let name = match session.tool {
         Tool::Select if session.space_down => "grab",
         Tool::Select => "default",
@@ -2536,6 +2783,182 @@ fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'sta
         },
     };
     Some(name)
+}
+
+/// The view settings that shape a drag or a hover.
+#[derive(Clone, Copy)]
+struct View {
+    rulers: bool,
+    guides: bool,
+    snap: bool,
+    width: f64,
+    height: f64,
+}
+
+impl View {
+    /// Space the rulers take along the top and left of the canvas.
+    fn inset(self) -> f64 {
+        if self.rulers {
+            RULER_SIZE
+        } else {
+            0.0
+        }
+    }
+}
+
+/// How close, in screen pixels, the pointer has to be to grab a guide.
+const GUIDE_REACH: f64 = 4.0;
+
+/// What a press at `(x, y)` does with guides: pull a new one out of a ruler,
+/// with `None`, or pick up an existing one by its place in its list. Handles
+/// win over guides, and the crop tool ignores them.
+fn guide_pickup(
+    session: &super::model::Session,
+    view: View,
+    x: f64,
+    y: f64,
+) -> Option<(bool, Option<usize>)> {
+    if view.rulers {
+        match (x < RULER_SIZE, y < RULER_SIZE) {
+            (true, true) => return None,
+            (true, false) => return Some((true, None)),
+            (false, true) => return Some((false, None)),
+            (false, false) => {}
+        }
+    }
+    if !view.guides || session.tool == Tool::Crop {
+        return None;
+    }
+    if session.tool == Tool::Move && hit_at(session, x, y).is_some() {
+        return None;
+    }
+    let guides = session.editor.document().guides();
+    let nearest = |lines: &[i32], pointer: f64, vertical: bool| {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, &line)| {
+                let (wx, wy) = doc_to_widget(session, line as f64, line as f64);
+                let at = if vertical { wx } else { wy };
+                ((at - pointer).abs(), index)
+            })
+            .filter(|&(distance, _)| distance <= GUIDE_REACH)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+    };
+    let vertical = nearest(&guides.x, x, true);
+    let horizontal = nearest(&guides.y, y, false);
+    match (vertical, horizontal) {
+        (Some(v), Some(h)) if h.0 < v.0 => Some((false, Some(h.1))),
+        (Some(v), _) => Some((true, Some(v.1))),
+        (None, Some(h)) => Some((false, Some(h.1))),
+        (None, None) => None,
+    }
+}
+
+/// Where a guide being dragged to `(x, y)` would land. It snaps to canvas and
+/// layer lines, and is marked for removal over its own ruler or off the canvas.
+#[allow(clippy::too_many_arguments)]
+fn guide_draft(
+    session: &super::model::Session,
+    view: View,
+    vertical: bool,
+    from: Option<usize>,
+    targets: &SnapTargets,
+    x: f64,
+    y: f64,
+    snap: bool,
+) -> GuideDraft {
+    let (px, py) = widget_to_doc(session, x, y);
+    let (raw, lines) = if vertical {
+        (px, &targets.x)
+    } else {
+        (py, &targets.y)
+    };
+    let snapped = snap
+        .then(|| snap_lines(&[raw], lines, SNAP_DISTANCE / session.zoom))
+        .flatten();
+    let position = snapped.map_or(raw, |(_, target)| target).round();
+    let over_ruler = view.rulers
+        && if vertical {
+            x < RULER_SIZE
+        } else {
+            y < RULER_SIZE
+        };
+    let outside = x < 0.0 || y < 0.0 || x > view.width || y > view.height;
+    GuideDraft {
+        vertical,
+        position,
+        from,
+        removing: over_ruler || outside,
+    }
+}
+
+/// A move drag's offset, with the moving box's edges or centre pulled onto a
+/// nearby line when `snap` is on, and the lines it snapped to.
+fn snapped_move(
+    session: &super::model::Session,
+    origin: (f64, f64),
+    bounds: Option<PixelRect>,
+    targets: &SnapTargets,
+    x: f64,
+    y: f64,
+    snap: bool,
+) -> (i32, i32, Vec<SnapLine>) {
+    let (mut dx, mut dy) = drag_offset(session, origin, x, y);
+    let mut lines = Vec::new();
+    let Some(bounds) = bounds.filter(|_| snap) else {
+        return (dx, dy, lines);
+    };
+    let reach = SNAP_DISTANCE / session.zoom;
+    let moved = PixelRect {
+        x: bounds.x + dx,
+        y: bounds.y + dy,
+        ..bounds
+    };
+    if let Some((shift, line)) = snap_lines(&x_lines(moved), &targets.x, reach) {
+        dx += shift.round() as i32;
+        lines.push(SnapLine::X(line));
+    }
+    if let Some((shift, line)) = snap_lines(&y_lines(moved), &targets.y, reach) {
+        dy += shift.round() as i32;
+        lines.push(SnapLine::Y(line));
+    }
+    (dx, dy, lines)
+}
+
+/// A resize drag's new box, with the dragged edges pulled onto nearby lines
+/// when `snap` is on, and the lines they snapped to.
+#[allow(clippy::too_many_arguments)]
+fn snapped_resize(
+    session: &super::model::Session,
+    origin: PixelRect,
+    handle: Handle,
+    targets: &SnapTargets,
+    x: f64,
+    y: f64,
+    keep_aspect: bool,
+    snap: bool,
+) -> (PixelRect, Vec<SnapLine>) {
+    let (mut px, mut py) = widget_to_doc(session, x, y);
+    let mut lines = Vec::new();
+    if snap {
+        let reach = SNAP_DISTANCE / session.zoom;
+        let moves_x = !matches!(handle, Handle::North | Handle::South);
+        let moves_y = !matches!(handle, Handle::East | Handle::West);
+        if moves_x {
+            if let Some((shift, line)) = snap_lines(&[px], &targets.x, reach) {
+                px += shift;
+                lines.push(SnapLine::X(line));
+            }
+        }
+        if moves_y {
+            if let Some((shift, line)) = snap_lines(&[py], &targets.y, reach) {
+                py += shift;
+                lines.push(SnapLine::Y(line));
+            }
+        }
+    }
+    (resize_rect(origin, handle, px, py, keep_aspect), lines)
 }
 
 fn cursor_text(cursor: Option<(i32, i32)>) -> String {

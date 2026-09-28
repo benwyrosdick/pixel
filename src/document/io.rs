@@ -1,7 +1,7 @@
 //! Open images, save the layered project, and export a flattened file.
 
 use super::composite::composite;
-use super::{Background, BlendMode, Document, Error, Layer};
+use super::{Background, BlendMode, Document, Error, Guides, Layer};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::{ImageEncoder, ImageReader, RgbaImage};
@@ -132,6 +132,7 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
         manifest.background.into(),
         layers,
         &selected,
+        manifest.guides,
         next_id,
     )
 }
@@ -158,6 +159,9 @@ struct Manifest {
     /// Missing from projects saved before multiple layers could be selected.
     #[serde(default)]
     selected: Vec<usize>,
+    /// Missing from projects saved before guides.
+    #[serde(default)]
+    guides: Guides,
     layers: Vec<LayerSer>,
 }
 
@@ -205,6 +209,7 @@ impl Manifest {
             },
             active: doc.active_index(),
             selected: doc.selected_indices(),
+            guides: doc.guides().clone(),
             layers: doc
                 .layers()
                 .iter()
@@ -437,6 +442,26 @@ mod tests {
         let path = dir.path().join("doc.pixel");
         save_project(editor.document(), &path).unwrap();
         assert_eq!(open_project(&path).unwrap().selected_indices(), vec![0, 2]);
+    }
+
+    #[test]
+    fn project_roundtrip_keeps_guides() {
+        let mut editor = Editor::new(sample_doc());
+        editor
+            .apply(Command::SetGuides {
+                guides: Guides {
+                    x: vec![1, -4],
+                    y: vec![2],
+                },
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        assert_eq!(
+            open_project(&path).unwrap().guides(),
+            editor.document().guides()
+        );
     }
 
     #[test]

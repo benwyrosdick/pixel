@@ -145,6 +145,34 @@ impl Layer {
     pub fn height(&self) -> u32 {
         self.pixels.height()
     }
+
+    /// The box around the layer's non-transparent pixels, in document space.
+    /// `None` when every pixel is transparent.
+    pub fn content_bounds(&self) -> Option<PixelRect> {
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for (x, y, pixel) in self.pixels.enumerate_pixels() {
+            if pixel[3] > 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+        (x0 < x1).then(|| PixelRect {
+            x: self.x + x0 as i32,
+            y: self.y + y0 as i32,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    }
+}
+
+/// Guide lines in document pixels: vertical guides by `x`, horizontal ones
+/// by `y`. A guide may sit off the canvas.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Guides {
+    pub x: Vec<i32>,
+    pub y: Vec<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +184,7 @@ pub struct Document {
     layers: Vec<Layer>,
     /// Ids of the selected layers. Ids, unlike indices, survive a reorder.
     selection: BTreeSet<u64>,
+    guides: Guides,
     next_id: u64,
 }
 
@@ -180,6 +209,7 @@ impl Document {
             background: spec.background,
             layers: Vec::new(),
             selection: BTreeSet::new(),
+            guides: Guides::default(),
             next_id: 1,
         };
         let layer = blank_layer(&mut doc, "Layer 1");
@@ -203,6 +233,7 @@ impl Document {
             background: Background::Transparent,
             layers: Vec::new(),
             selection: BTreeSet::new(),
+            guides: Guides::default(),
             next_id: 1,
         };
         let mut layer = blank_layer(&mut doc, "Layer 1");
@@ -233,6 +264,10 @@ impl Document {
         (0..self.layers.len())
             .filter(|&index| self.is_selected(index))
             .collect()
+    }
+
+    pub fn guides(&self) -> &Guides {
+        &self.guides
     }
 
     pub fn is_selected(&self, index: usize) -> bool {
@@ -366,6 +401,7 @@ impl Document {
         background: Background,
         layers: Vec<Layer>,
         selected: &[usize],
+        guides: Guides,
         next_id: u64,
     ) -> Result<Self, Error> {
         check_size(width, height)?;
@@ -390,6 +426,7 @@ impl Document {
             background,
             layers,
             selection,
+            guides,
             next_id: next_id.max(1),
         })
     }
@@ -474,6 +511,10 @@ pub enum Command {
     AlignLayers {
         indices: Vec<usize>,
         to: Alignment,
+    },
+    /// Replace every guide.
+    SetGuides {
+        guides: Guides,
     },
     /// Even out the gaps between the listed layers' visible pixels along
     /// `axis`, keeping the outermost two in place. Horizontal spaces them
@@ -562,6 +603,7 @@ struct GeomSnap {
     ppi: f32,
     background: Background,
     selection: BTreeSet<u64>,
+    guides: Guides,
     layers: Vec<GeomLayer>,
 }
 
@@ -674,6 +716,7 @@ fn geom_snap(doc: &Document) -> GeomSnap {
         ppi: doc.ppi,
         background: doc.background,
         selection: doc.selection.clone(),
+        guides: doc.guides.clone(),
         layers: doc
             .layers
             .iter()
@@ -722,6 +765,7 @@ fn restore_geom(doc: &mut Document, snap: GeomSnap) {
     }
     doc.layers = ordered;
     doc.selection = snap.selection;
+    doc.guides = snap.guides;
 }
 
 /// `Ok(false)` means the command is valid and would not change the document.
@@ -756,6 +800,7 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
         Command::AlignLayers { indices, to } => {
             Ok(!arrange::align_shifts(doc, indices, *to)?.is_empty())
         }
+        Command::SetGuides { guides } => Ok(doc.guides != *guides),
         Command::DistributeLayers { indices, axis } => {
             Ok(!arrange::distribute_shifts(doc, indices, *axis)?.is_empty())
         }
@@ -946,6 +991,7 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             let shifts = arrange::align_shifts(doc, &indices, to)?;
             shift_layers(doc, shifts)?;
         }
+        Command::SetGuides { guides } => doc.guides = guides,
         Command::DistributeLayers { indices, axis } => {
             let shifts = arrange::distribute_shifts(doc, &indices, axis)?;
             shift_layers(doc, shifts)?;
@@ -1359,6 +1405,88 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(editor.document().content_bounds(), None);
+    }
+
+    fn set_guides(editor: &mut Editor, x: &[i32], y: &[i32]) {
+        editor
+            .apply(Command::SetGuides {
+                guides: Guides {
+                    x: x.to_vec(),
+                    y: y.to_vec(),
+                },
+            })
+            .unwrap();
+    }
+
+    fn guides_of(editor: &Editor) -> (Vec<i32>, Vec<i32>) {
+        let guides = editor.document().guides();
+        (guides.x.clone(), guides.y.clone())
+    }
+
+    #[test]
+    fn guides_are_undoable_and_follow_the_canvas_through_crop_and_resize() {
+        let mut editor = doc_with(10, 8, (0, 0), rgba(255, 0, 0, 255));
+        set_guides(&mut editor, &[3, 9], &[2]);
+        assert!(!editor
+            .apply(Command::SetGuides {
+                guides: editor.document().guides().clone(),
+            })
+            .unwrap());
+        editor
+            .apply(Command::Crop {
+                x: 2,
+                y: 1,
+                width: 6,
+                height: 6,
+            })
+            .unwrap();
+        assert_eq!(guides_of(&editor), (vec![1, 7], vec![1]));
+        editor
+            .apply(Command::ResizeCanvas {
+                width: 8,
+                height: 8,
+                anchor: Anchor::Center,
+            })
+            .unwrap();
+        assert_eq!(guides_of(&editor), (vec![2, 8], vec![2]));
+        editor.undo();
+        editor.undo();
+        assert_eq!(guides_of(&editor), (vec![3, 9], vec![2]));
+        editor.undo();
+        assert_eq!(guides_of(&editor), (vec![], vec![]));
+    }
+
+    #[test]
+    fn guides_turn_and_mirror_with_the_canvas() {
+        let mut editor = doc_with(10, 6, (0, 0), rgba(255, 0, 0, 255));
+        set_guides(&mut editor, &[3], &[1]);
+        editor
+            .apply(Command::RotateCanvas {
+                turn: QuarterTurn::Cw,
+            })
+            .unwrap();
+        // The row at y = 1 of a 6 px tall canvas becomes the column at x = 5.
+        assert_eq!(guides_of(&editor), (vec![5], vec![3]));
+        editor
+            .apply(Command::RotateCanvas {
+                turn: QuarterTurn::Ccw,
+            })
+            .unwrap();
+        assert_eq!(guides_of(&editor), (vec![3], vec![1]));
+        editor
+            .apply(Command::FlipCanvas {
+                axis: Axis::Horizontal,
+            })
+            .unwrap();
+        assert_eq!(guides_of(&editor), (vec![7], vec![1]));
+        editor
+            .apply(Command::ScaleDocument {
+                width: 20,
+                height: 12,
+                filter: ScaleFilter::Nearest,
+            })
+            .unwrap();
+        assert_eq!(guides_of(&editor), (vec![14], vec![2]));
     }
 
     #[test]

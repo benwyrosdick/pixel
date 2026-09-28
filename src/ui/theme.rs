@@ -52,6 +52,16 @@ impl ThemeColors {
         }
     }
 
+    /// Bars and rulers, drawn in the header's color.
+    pub fn chrome_rgb(&self) -> (f32, f32, f32) {
+        parse_hex(&self.dark_background).unwrap_or(self.background_rgb)
+    }
+
+    /// Text on bars and rulers.
+    pub fn chrome_text_rgb(&self) -> (f32, f32, f32) {
+        parse_hex(&self.dark_foreground).unwrap_or((0.6, 0.6, 0.6))
+    }
+
     pub fn css(&self) -> String {
         format!(
             r#"

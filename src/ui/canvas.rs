@@ -1,6 +1,9 @@
 //! Pan, zoom, and draw the flattened document. Input is reported upward.
 
-use super::model::{active_bounds, doc_to_widget, layer_bounds, rendered, Model, Session, Tool};
+use super::model::{
+    active_bounds, doc_to_widget, layer_bounds, rendered, widget_to_doc, Model, Session, SnapLine,
+    Tool,
+};
 use gtk::gdk;
 use gtk::glib;
 use gtk::graphene;
@@ -10,14 +13,48 @@ use pixel::document::{rotate_handle_point, ROTATE_OFFSET};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 
+/// How thick the rulers along the top and left edges are, in screen pixels.
+pub const RULER_SIZE: f64 = 20.0;
+
+/// Guide lines, in the cyan most editors use so they stand apart from layers.
+const GUIDE_COLOR: (f32, f32, f32) = (0.15, 0.78, 0.96);
+
+/// Smart guides, drawn while a drag is snapped.
+const SMART_GUIDE_COLOR: (f32, f32, f32) = (1.0, 0.31, 0.85);
+
 pub enum CanvasInput {
-    DragBegin { x: f64, y: f64, button: u32 },
-    DragUpdate { x: f64, y: f64, shift: bool },
-    DragEnd { x: f64, y: f64, shift: bool },
-    Motion { x: f64, y: f64 },
+    DragBegin {
+        x: f64,
+        y: f64,
+        button: u32,
+    },
+    /// `ctrl` held turns snapping off for the drag.
+    DragUpdate {
+        x: f64,
+        y: f64,
+        shift: bool,
+        ctrl: bool,
+    },
+    DragEnd {
+        x: f64,
+        y: f64,
+        shift: bool,
+        ctrl: bool,
+    },
+    Motion {
+        x: f64,
+        y: f64,
+    },
     Leave,
-    Scroll { x: f64, y: f64, dy: f64 },
-    Resize { width: i32, height: i32 },
+    Scroll {
+        x: f64,
+        y: f64,
+        dy: f64,
+    },
+    Resize {
+        width: i32,
+        height: i32,
+    },
 }
 
 mod imp {
@@ -76,6 +113,13 @@ mod imp {
                 return;
             };
             self.paint_document(snapshot, session, &model);
+            if model.show_guides {
+                draw_guides(snapshot, session, width as f64, height as f64);
+            }
+            draw_smart_guides(snapshot, session, width as f64, height as f64);
+            if model.show_rulers {
+                self.draw_rulers(snapshot, session, &model, width as f64, height as f64);
+            }
         }
 
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
@@ -113,13 +157,12 @@ mod imp {
                 let Some((x0, y0)) = canvas.imp().drag_origin.get() else {
                     return;
                 };
-                let shift = gesture
-                    .current_event_state()
-                    .contains(gdk::ModifierType::SHIFT_MASK);
+                let state = gesture.current_event_state();
                 canvas.imp().emit(CanvasInput::DragUpdate {
                     x: x0 + dx,
                     y: y0 + dy,
-                    shift,
+                    shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+                    ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
                 });
             });
             let canvas = obj.clone();
@@ -127,13 +170,12 @@ mod imp {
                 let Some((x0, y0)) = canvas.imp().drag_origin.take() else {
                     return;
                 };
-                let shift = gesture
-                    .current_event_state()
-                    .contains(gdk::ModifierType::SHIFT_MASK);
+                let state = gesture.current_event_state();
                 canvas.imp().emit(CanvasInput::DragEnd {
                     x: x0 + dx,
                     y: y0 + dy,
-                    shift,
+                    shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+                    ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
                 });
             });
             obj.add_controller(drag);
@@ -204,6 +246,90 @@ mod imp {
             if session.tool != Tool::Crop {
                 draw_selection(snapshot, session, model.accent);
             }
+        }
+
+        /// Rulers along the top and left edges, numbered in document pixels,
+        /// with a mark where the pointer is.
+        fn draw_rulers(
+            &self,
+            snapshot: &gtk::Snapshot,
+            session: &Session,
+            model: &Model,
+            width: f64,
+            height: f64,
+        ) {
+            let size = RULER_SIZE;
+            let (r, g, b) = model.chrome;
+            let fill = gdk::RGBA::new(r, g, b, 1.0);
+            let (r, g, b) = model.chrome_text;
+            let ink = gdk::RGBA::new(r, g, b, 1.0);
+            let faint = gdk::RGBA::new(r, g, b, 0.35);
+            let rect = |x: f64, y: f64, w: f64, h: f64| {
+                graphene::Rect::new(x as f32, y as f32, w as f32, h as f32)
+            };
+            snapshot.append_color(&fill, &rect(0.0, 0.0, width, size));
+            snapshot.append_color(&fill, &rect(0.0, 0.0, size, height));
+            snapshot.append_color(&faint, &rect(size, size - 1.0, width - size, 1.0));
+            snapshot.append_color(&faint, &rect(size - 1.0, size, 1.0, height - size));
+
+            let (major, minor) = ruler_steps(session.zoom);
+            let (x_from, y_from) = widget_to_doc(session, size, size);
+            let (x_to, y_to) = widget_to_doc(session, width, height);
+            let obj = self.obj();
+            let label = |text: &str| {
+                let layout = obj.create_pango_layout(Some(text));
+                let attrs = gtk::pango::AttrList::new();
+                attrs.insert(gtk::pango::AttrFloat::new_scale(0.7));
+                layout.set_attributes(Some(&attrs));
+                layout
+            };
+            let mut value = (x_from / minor).floor() * minor;
+            while value <= x_to {
+                let x = (session.pan_x + value * session.zoom).round();
+                if x >= size {
+                    let is_major = (value / major).round() * major == value;
+                    let tick = if is_major { size * 0.5 } else { size * 0.25 };
+                    snapshot.append_color(&ink, &rect(x, size - tick, 1.0, tick));
+                    if is_major {
+                        snapshot.save();
+                        snapshot.translate(&graphene::Point::new(x as f32 + 2.0, 0.0));
+                        snapshot.append_layout(&label(&format!("{value}")), &ink);
+                        snapshot.restore();
+                    }
+                }
+                value += minor;
+            }
+            let mut value = (y_from / minor).floor() * minor;
+            while value <= y_to {
+                let y = (session.pan_y + value * session.zoom).round();
+                if y >= size {
+                    let is_major = (value / major).round() * major == value;
+                    let tick = if is_major { size * 0.5 } else { size * 0.25 };
+                    snapshot.append_color(&ink, &rect(size - tick, y, tick, 1.0));
+                    if is_major {
+                        // Read bottom to top, like most editors.
+                        snapshot.save();
+                        snapshot.translate(&graphene::Point::new(0.0, y as f32 - 2.0));
+                        snapshot.rotate(-90.0);
+                        snapshot.append_layout(&label(&format!("{value}")), &ink);
+                        snapshot.restore();
+                    }
+                }
+                value += minor;
+            }
+
+            if let Some((cx, cy)) = session.cursor {
+                let (r, g, b) = model.accent;
+                let mark = gdk::RGBA::new(r, g, b, 1.0);
+                let (x, y) = doc_to_widget(session, cx as f64 + 0.5, cy as f64 + 0.5);
+                if x >= size {
+                    snapshot.append_color(&mark, &rect(x.round(), 0.0, 1.0, size));
+                }
+                if y >= size {
+                    snapshot.append_color(&mark, &rect(0.0, y.round(), size, 1.0));
+                }
+            }
+            snapshot.append_color(&fill, &rect(0.0, 0.0, size, size));
         }
 
         fn document_texture(&self, session: &Session) -> gdk::MemoryTexture {
@@ -338,6 +464,100 @@ fn draw_handles(snapshot: &gtk::Snapshot, session: &Session, accent: (f32, f32, 
     ] {
         draw_knob(snapshot, x, y, &fill, &stroke);
     }
+}
+
+/// Document pixels between numbered ticks, and between all ticks, so labels
+/// stay about 60 screen pixels apart at any zoom.
+fn ruler_steps(zoom: f64) -> (f64, f64) {
+    const STEPS: [f64; 13] = [
+        1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+    ];
+    let major = STEPS
+        .into_iter()
+        .find(|step| step * zoom >= 60.0)
+        .unwrap_or(10000.0);
+    let minor = if major >= 5.0 && major % 5.0 == 0.0 {
+        major / 5.0
+    } else {
+        major / 2.0
+    };
+    // Ticks closer than 4 px blur together, so fall back to the labelled ones.
+    let minor = if minor * zoom < 4.0 || minor < 1.0 {
+        major
+    } else {
+        minor
+    };
+    (major, minor)
+}
+
+/// Guides across the whole canvas. A guide being moved is drawn where it is
+/// headed, or dimmed when letting go would remove it.
+fn draw_guides(snapshot: &gtk::Snapshot, session: &Session, width: f64, height: f64) {
+    let (r, g, b) = GUIDE_COLOR;
+    let color = gdk::RGBA::new(r, g, b, 0.9);
+    let guides = session.editor.document().guides();
+    let draft = session.guide_draft;
+    let hidden = |vertical: bool, index: usize| {
+        draft.is_some_and(|draft| draft.vertical == vertical && draft.from == Some(index))
+    };
+    for (index, &x) in guides.x.iter().enumerate() {
+        if !hidden(true, index) {
+            vertical_line(snapshot, session, x as f64, height, &color);
+        }
+    }
+    for (index, &y) in guides.y.iter().enumerate() {
+        if !hidden(false, index) {
+            horizontal_line(snapshot, session, y as f64, width, &color);
+        }
+    }
+    if let Some(draft) = draft {
+        let alpha = if draft.removing { 0.35 } else { 1.0 };
+        let color = gdk::RGBA::new(r, g, b, alpha);
+        if draft.vertical {
+            vertical_line(snapshot, session, draft.position, height, &color);
+        } else {
+            horizontal_line(snapshot, session, draft.position, width, &color);
+        }
+    }
+}
+
+fn draw_smart_guides(snapshot: &gtk::Snapshot, session: &Session, width: f64, height: f64) {
+    let (r, g, b) = SMART_GUIDE_COLOR;
+    let color = gdk::RGBA::new(r, g, b, 1.0);
+    for line in &session.snap_lines {
+        match *line {
+            SnapLine::X(x) => vertical_line(snapshot, session, x, height, &color),
+            SnapLine::Y(y) => horizontal_line(snapshot, session, y, width, &color),
+        }
+    }
+}
+
+fn vertical_line(
+    snapshot: &gtk::Snapshot,
+    session: &Session,
+    x: f64,
+    height: f64,
+    color: &gdk::RGBA,
+) {
+    let (x, _) = doc_to_widget(session, x, 0.0);
+    snapshot.append_color(
+        color,
+        &graphene::Rect::new(x.round() as f32, 0.0, 1.0, height as f32),
+    );
+}
+
+fn horizontal_line(
+    snapshot: &gtk::Snapshot,
+    session: &Session,
+    y: f64,
+    width: f64,
+    color: &gdk::RGBA,
+) {
+    let (_, y) = doc_to_widget(session, 0.0, y);
+    snapshot.append_color(
+        color,
+        &graphene::Rect::new(0.0, y.round() as f32, width as f32, 1.0),
+    );
 }
 
 fn stroke_rect(

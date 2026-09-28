@@ -58,16 +58,47 @@ pub struct Session {
     pub crop: Option<CropDraft>,
     /// The select tool's drag box, as two document-space corners.
     pub marquee: Option<(f64, f64, f64, f64)>,
+    /// Lines the current drag has snapped to, drawn as smart guides.
+    pub snap_lines: Vec<SnapLine>,
+    /// A guide being dragged out of a ruler or moved.
+    pub guide_draft: Option<GuideDraft>,
     pub preview: Option<Preview>,
     /// Bumped whenever the flattened image changes. Pan and zoom do not bump it.
     pub visual: u64,
     pub cursor: Option<(i32, i32)>,
 }
 
+/// A smart guide: a vertical line at an `x`, or a horizontal one at a `y`,
+/// in document pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SnapLine {
+    X(f64),
+    Y(f64),
+}
+
+/// A guide on its way out of a ruler, or being moved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GuideDraft {
+    /// A vertical guide, placed by `x`, rather than a horizontal one.
+    pub vertical: bool,
+    pub position: f64,
+    /// Where the guide being moved sits in its list. It is hidden meanwhile.
+    /// `None` for a new guide.
+    pub from: Option<usize>,
+    /// Letting go here, over its ruler or outside the canvas, removes it.
+    pub removing: bool,
+}
+
 pub struct Model {
     pub session: Option<Session>,
     pub accent: (f32, f32, f32),
     pub background: (f32, f32, f32),
+    /// Ruler background and text.
+    pub chrome: (f32, f32, f32),
+    pub chrome_text: (f32, f32, f32),
+    pub show_rulers: bool,
+    pub show_guides: bool,
+    pub snap: bool,
 }
 
 impl Model {
@@ -84,6 +115,8 @@ impl Model {
             space_down: false,
             crop: None,
             marquee: None,
+            snap_lines: Vec::new(),
+            guide_draft: None,
             preview: None,
             visual: 1,
             cursor: None,
@@ -225,16 +258,19 @@ pub fn layer_bounds(session: &Session, index: usize) -> PixelRect {
     }
 }
 
-pub fn fit_view(session: &mut Session, alloc_w: i32, alloc_h: i32) {
+/// Zoom and centre the document in the canvas. `inset` is the space the
+/// rulers take along the top and left edges.
+pub fn fit_view(session: &mut Session, alloc_w: i32, alloc_h: i32, inset: f64) {
     let doc = session.editor.document();
-    let avail_w = (alloc_w as f64 - 32.0).max(1.0);
-    let avail_h = (alloc_h as f64 - 32.0).max(1.0);
+    let (width, height) = (alloc_w as f64 - inset, alloc_h as f64 - inset);
+    let avail_w = (width - 32.0).max(1.0);
+    let avail_h = (height - 32.0).max(1.0);
     let zoom = (avail_w / doc.width as f64)
         .min(avail_h / doc.height as f64)
         .clamp(0.05, 32.0);
     session.zoom = zoom;
-    session.pan_x = (alloc_w as f64 - doc.width as f64 * zoom) / 2.0;
-    session.pan_y = (alloc_h as f64 - doc.height as f64 * zoom) / 2.0;
+    session.pan_x = inset + (width - doc.width as f64 * zoom) / 2.0;
+    session.pan_y = inset + (height - doc.height as f64 * zoom) / 2.0;
 }
 
 pub fn widget_to_doc(session: &Session, x: f64, y: f64) -> (f64, f64) {

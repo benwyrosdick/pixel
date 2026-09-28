@@ -1,29 +1,10 @@
 //! Align and distribute layers by their visible pixels.
 
-use super::{Alignment, Axis, Document, Error, Layer, PixelRect};
+use super::{Alignment, Axis, Document, Error, PixelRect};
 use std::collections::BTreeSet;
 
 /// A layer and how far to shift it.
 pub(crate) type Shift = (usize, i32, i32);
-
-/// The box around a layer's non-transparent pixels, in document space.
-fn content_bounds(layer: &Layer) -> Option<PixelRect> {
-    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
-    for (x, y, pixel) in layer.pixels.enumerate_pixels() {
-        if pixel[3] > 0 {
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x + 1);
-            y1 = y1.max(y + 1);
-        }
-    }
-    (x0 < x1).then(|| PixelRect {
-        x: layer.x + x0 as i32,
-        y: layer.y + y0 as i32,
-        width: x1 - x0,
-        height: y1 - y0,
-    })
-}
 
 /// The listed layers an arrange command may move, bottom to top, with their
 /// content boxes. Locked and empty layers are left out.
@@ -35,7 +16,7 @@ fn movable(doc: &Document, indices: &[usize]) -> Result<Vec<(usize, PixelRect)>,
         if layer.locked {
             continue;
         }
-        if let Some(bounds) = content_bounds(layer) {
+        if let Some(bounds) = layer.content_bounds() {
             items.push((index, bounds));
         }
     }
@@ -130,7 +111,7 @@ fn edges(rect: PixelRect) -> (i64, i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Background, NewCanvas};
+    use crate::document::{Background, Layer, NewCanvas};
     use image::{Rgba, RgbaImage};
 
     /// A 20×20 transparent canvas with one solid layer per `(x, y, w, h)`.
