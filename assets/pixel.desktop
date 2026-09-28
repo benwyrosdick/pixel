@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Pixel
+Comment=Photo editor
+Exec=pixel %F
+Icon=pixel
+Terminal=false
+Type=Application
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/webp;application/x-pixel;
+StartupWMClass=app.pixel.Pixel
