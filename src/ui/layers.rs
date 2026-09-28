@@ -232,22 +232,98 @@ fn layer_row(shell: &Rc<Shell>, index: usize, layer: &Layer) -> gtk::ListBoxRow 
         });
     });
 
-    let name = gtk::EditableLabel::new(&layer.name);
-    name.set_hexpand(true);
-    let shell_name = shell.clone();
-    name.connect_editing_notify(move |label| {
-        if label.is_editing() {
-            return;
+    // A plain label, not an entry. A click selects the row. Double-click
+    // swaps in the entry to rename.
+    let name_label = gtk::Label::new(Some(&layer.name));
+    name_label.set_xalign(0.0);
+    name_label.set_hexpand(true);
+    name_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name_label.set_can_target(false);
+    row.set_tooltip_text(Some("Double-click the name to rename"));
+
+    let entry = gtk::Entry::new();
+    entry.set_hexpand(true);
+    entry.set_has_frame(false);
+    entry.set_text(&layer.name);
+
+    let name_box = gtk::Stack::new();
+    name_box.set_hexpand(true);
+    name_box.add_named(&name_label, Some("label"));
+    name_box.add_named(&entry, Some("edit"));
+
+    let editing = Rc::new(Cell::new(false));
+    let original = layer.name.clone();
+    let end_edit: Rc<dyn Fn(bool)> = Rc::new({
+        let entry = entry.clone();
+        let name_box = name_box.clone();
+        let editing = editing.clone();
+        let shell = shell.clone();
+        let original = original.clone();
+        move |save: bool| {
+            if !editing.get() {
+                return;
+            }
+            editing.set(false);
+            let name = entry.text().to_string();
+            name_box.set_visible_child_name("label");
+            if save && name != original {
+                let shell = shell.clone();
+                glib::idle_add_local_once(move || {
+                    shell.edit(Command::Rename { index, name });
+                });
+            }
         }
-        let name = label.text().to_string();
-        let shell = shell_name.clone();
-        glib::idle_add_local_once(move || {
-            shell.edit(Command::Rename { index, name });
-        });
     });
 
+    let begin_edit = {
+        let entry = entry.clone();
+        let name_box = name_box.clone();
+        let editing = editing.clone();
+        let original = original.clone();
+        move || {
+            if editing.get() {
+                return;
+            }
+            editing.set(true);
+            entry.set_text(&original);
+            name_box.set_visible_child_name("edit");
+            entry.grab_focus();
+            entry.select_region(0, -1);
+        }
+    };
+
+    let end_on_activate = Rc::clone(&end_edit);
+    entry.connect_activate(move |_| end_on_activate(true));
+
+    let end_on_leave = Rc::clone(&end_edit);
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave(move |_| end_on_leave(true));
+    entry.add_controller(focus);
+
+    let end_on_escape = Rc::clone(&end_edit);
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            end_on_escape(false);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    entry.add_controller(keys);
+
+    let eye_for_hit = eye.clone();
+    let rename_click = gtk::GestureClick::new();
+    rename_click.set_button(gdk::BUTTON_PRIMARY);
+    rename_click.connect_pressed(move |_, n_press, x, _| {
+        if n_press == 2 && x > f64::from(eye_for_hit.width().max(1) + 12) {
+            begin_edit();
+        }
+    });
+    row.add_controller(rename_click);
+
     content.append(&eye);
-    content.append(&name);
+    content.append(&name_box);
     row.set_child(Some(&content));
 
     let source = gtk::DragSource::new();
