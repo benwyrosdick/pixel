@@ -1,7 +1,10 @@
 //! Window state that is not part of the undoable document.
 
 use image::RgbaImage;
-use pixel::document::{composite_with, Background, Document, Editor, LayerOverride};
+use pixel::document::{
+    composite_with, rotate_bitmap, rotated_bounds, Background, Document, Editor, LayerOverride,
+    PixelRect,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -18,8 +21,26 @@ pub struct CropDraft {
 }
 
 pub enum Preview {
-    Move { index: usize, x: i32, y: i32 },
-    Opacity { index: usize, opacity: f32 },
+    Move {
+        index: usize,
+        x: i32,
+        y: i32,
+    },
+    Opacity {
+        index: usize,
+        opacity: f32,
+    },
+    Resize {
+        index: usize,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
+    Rotate {
+        index: usize,
+        degrees_cw: f32,
+    },
 }
 
 pub struct Session {
@@ -84,26 +105,96 @@ pub fn document_title(session: Option<&Session>) -> String {
 
 pub fn rendered(session: &Session) -> RgbaImage {
     let doc = session.editor.document();
-    let overrides = session.preview.as_ref().map(|preview| {
-        let (index, x, y, opacity, visible) = match *preview {
-            Preview::Move { index, x, y } => {
-                let layer = &doc.layers()[index];
-                (index, x, y, layer.opacity, layer.visible)
-            }
-            Preview::Opacity { index, opacity } => {
-                let layer = &doc.layers()[index];
-                (index, layer.x, layer.y, opacity, layer.visible)
+    let overrides = session.preview.as_ref().and_then(|preview| {
+        let layer_at = |index: usize| &doc.layers()[index];
+        let override_for = |index: usize, x: i32, y: i32, pixels: Option<RgbaImage>| {
+            let layer = layer_at(index);
+            LayerOverride {
+                index,
+                x,
+                y,
+                opacity: layer.opacity,
+                visible: layer.visible,
+                pixels,
             }
         };
-        vec![LayerOverride {
-            index,
-            x,
-            y,
-            opacity,
-            visible,
-        }]
+        let item = match *preview {
+            Preview::Move { index, x, y } => override_for(index, x, y, None),
+            Preview::Opacity { index, opacity } => {
+                let layer = layer_at(index);
+                LayerOverride {
+                    index,
+                    x: layer.x,
+                    y: layer.y,
+                    opacity,
+                    visible: layer.visible,
+                    pixels: None,
+                }
+            }
+            Preview::Resize {
+                index,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let layer = layer_at(index);
+                let pixels = image::imageops::resize(
+                    &layer.pixels,
+                    width.max(1),
+                    height.max(1),
+                    image::imageops::FilterType::Triangle,
+                );
+                override_for(index, x, y, Some(pixels))
+            }
+            Preview::Rotate { index, degrees_cw } => {
+                let layer = layer_at(index);
+                let (pixels, x, y) = rotate_bitmap(&layer.pixels, layer.x, layer.y, degrees_cw);
+                override_for(index, x, y, Some(pixels))
+            }
+        };
+        Some(vec![item])
     });
     composite_with(doc, overrides.as_deref())
+}
+
+/// Where the active layer is drawn, including an in-progress move, resize, or rotate.
+pub fn active_bounds(session: &Session) -> PixelRect {
+    let doc = session.editor.document();
+    let index = doc.active_index();
+    let layer = doc.active_layer();
+    match session.preview {
+        Some(Preview::Move { index: i, x, y }) if i == index => PixelRect {
+            x,
+            y,
+            width: layer.width(),
+            height: layer.height(),
+        },
+        Some(Preview::Resize {
+            index: i,
+            x,
+            y,
+            width,
+            height,
+        }) if i == index => PixelRect {
+            x,
+            y,
+            width,
+            height,
+        },
+        Some(Preview::Rotate {
+            index: i,
+            degrees_cw,
+        }) if i == index => {
+            rotated_bounds(layer.x, layer.y, layer.width(), layer.height(), degrees_cw)
+        }
+        _ => PixelRect {
+            x: layer.x,
+            y: layer.y,
+            width: layer.width(),
+            height: layer.height(),
+        },
+    }
 }
 
 pub fn fit_view(session: &mut Session, alloc_w: i32, alloc_h: i32) {
@@ -122,6 +213,13 @@ pub fn widget_to_doc(session: &Session, x: f64, y: f64) -> (f64, f64) {
     (
         (x - session.pan_x) / session.zoom,
         (y - session.pan_y) / session.zoom,
+    )
+}
+
+pub fn doc_to_widget(session: &Session, x: f64, y: f64) -> (f64, f64) {
+    (
+        session.pan_x + x * session.zoom,
+        session.pan_y + y * session.zoom,
     )
 }
 

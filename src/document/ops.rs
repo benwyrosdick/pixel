@@ -147,6 +147,25 @@ pub fn scale_document(
     Ok(())
 }
 
+pub fn scale_layer(
+    doc: &mut Document,
+    index: usize,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> Result<(), Error> {
+    if width == 0 || height == 0 {
+        return Err(Error::ZeroSize);
+    }
+    let layer = doc.layers.get_mut(index).ok_or(Error::BadLayer)?;
+    layer.pixels = imageops::resize(&layer.pixels, width, height, filter);
+    layer.x = x;
+    layer.y = y;
+    Ok(())
+}
+
 pub fn rotate_canvas(doc: &mut Document, turn: QuarterTurn) {
     let (width, height) = (doc.width, doc.height);
     for layer in &mut doc.layers {
@@ -218,29 +237,86 @@ pub fn rotate_layer(doc: &mut Document, index: usize, degrees_cw: f32) -> Result
     if degrees_cw.abs() % 360.0 <= 1e-3 {
         return Ok(());
     }
-    let (w, h) = layer.pixels.dimensions();
-    let theta = degrees_cw.to_radians();
-    let (nw, nh) = expanded_size(w, h, theta);
-    // Bicubic sampling in imageproc returns transparent unless the whole 4×4
-    // neighborhood is inside the buffer, so pad before rotating and crop it off.
-    let pad = 2u32;
-    let mut padded = RgbaImage::new(nw + pad * 2, nh + pad * 2);
-    let ox = (pad + (nw - w) / 2) as i64;
-    let oy = (pad + (nh - h) / 2) as i64;
-    imageops::overlay(&mut padded, &layer.pixels, ox, oy);
-    let rotated = rotate_about_center(&padded, theta, Interpolation::Bicubic, Rgba([0, 0, 0, 0]));
-    let cropped = imageops::crop_imm(&rotated, pad, pad, nw, nh).to_image();
-    let old_cx = layer.x as f64 + w as f64 / 2.0;
-    let old_cy = layer.y as f64 + h as f64 / 2.0;
-    layer.x = (old_cx - nw as f64 / 2.0).round() as i32;
-    layer.y = (old_cy - nh as f64 / 2.0).round() as i32;
-    layer.pixels = cropped;
+    let (pixels, x, y) = rotate_bitmap(&layer.pixels, layer.x, layer.y, degrees_cw);
+    layer.pixels = pixels;
+    layer.x = x;
+    layer.y = y;
     Ok(())
 }
 
+/// Rotate a layer bitmap clockwise around its center. The returned origin
+/// keeps that center in the same place.
+pub fn rotate_bitmap(pixels: &RgbaImage, x: i32, y: i32, degrees_cw: f32) -> (RgbaImage, i32, i32) {
+    let (w, h) = pixels.dimensions();
+    if w == 0 || h == 0 || !degrees_cw.is_finite() {
+        return (pixels.clone(), x, y);
+    }
+    let theta = degrees_cw.to_radians();
+    let (nw, nh) = expanded_size(w, h, theta);
+    // Bicubic sampling needs a margin. When the rotated box is at least as
+    // large as the source, center the source in that box. A wide layer turned
+    // sideways makes one side smaller than the source, and `nw - w` would
+    // underflow, so that case uses a buffer big enough for both.
+    let pad = 2u32;
+    let (buffer_w, buffer_h, ox, oy, crop_x, crop_y, crop_w, crop_h) = if nw >= w && nh >= h {
+        (
+            nw + pad * 2,
+            nh + pad * 2,
+            (pad + (nw - w) / 2) as i64,
+            (pad + (nh - h) / 2) as i64,
+            pad,
+            pad,
+            nw,
+            nh,
+        )
+    } else {
+        let buffer_w = nw.max(w).saturating_add(pad * 2);
+        let buffer_h = nh.max(h).saturating_add(pad * 2);
+        let crop_w = nw.saturating_add(pad * 2).min(buffer_w).max(1);
+        let crop_h = nh.saturating_add(pad * 2).min(buffer_h).max(1);
+        (
+            buffer_w,
+            buffer_h,
+            ((buffer_w - w) / 2) as i64,
+            ((buffer_h - h) / 2) as i64,
+            (buffer_w - crop_w) / 2,
+            (buffer_h - crop_h) / 2,
+            crop_w,
+            crop_h,
+        )
+    };
+    if buffer_w.saturating_mul(buffer_h) > 40_000_000
+        || crop_x.saturating_add(crop_w) > buffer_w
+        || crop_y.saturating_add(crop_h) > buffer_h
+    {
+        return (pixels.clone(), x, y);
+    }
+    let mut padded = RgbaImage::new(buffer_w, buffer_h);
+    imageops::overlay(&mut padded, pixels, ox, oy);
+    let rotated = rotate_about_center(&padded, theta, Interpolation::Bicubic, Rgba([0, 0, 0, 0]));
+    let cropped = imageops::crop_imm(&rotated, crop_x, crop_y, crop_w, crop_h).to_image();
+    let old_cx = x as f64 + w as f64 / 2.0;
+    let old_cy = y as f64 + h as f64 / 2.0;
+    let nx = (old_cx - crop_w as f64 / 2.0).round() as i32;
+    let ny = (old_cy - crop_h as f64 / 2.0).round() as i32;
+    (cropped, nx, ny)
+}
+
 fn expanded_size(width: u32, height: u32, theta: f32) -> (u32, u32) {
-    let (sin, cos) = (theta.sin().abs(), theta.cos().abs());
-    let nw = (width as f32 * cos + height as f32 * sin).ceil() as u32;
-    let nh = (width as f32 * sin + height as f32 * cos).ceil() as u32;
-    (nw.max(1), nh.max(1))
+    let (sin, cos) = theta.sin_cos();
+    let (sin, cos) = (sin.abs(), cos.abs());
+    if !sin.is_finite() || !cos.is_finite() {
+        return (width.max(1), height.max(1));
+    }
+    let nw = width as f32 * cos + height as f32 * sin;
+    let nh = width as f32 * sin + height as f32 * cos;
+    (finite_edge(nw, width), finite_edge(nh, height))
+}
+
+fn finite_edge(value: f32, fallback: u32) -> u32 {
+    if value.is_finite() && value >= 1.0 {
+        (value.ceil().min(100_000.0) as u32).max(1)
+    } else {
+        fallback.max(1)
+    }
 }

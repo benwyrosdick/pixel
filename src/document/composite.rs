@@ -20,14 +20,17 @@ pub fn composite_with(doc: &Document, overrides: Option<&[LayerOverride]>) -> Rg
         }
     }
     for (index, layer) in doc.layers.iter().enumerate() {
-        let (x, y, opacity, visible) = overrides
-            .and_then(|list| list.iter().find(|item| item.index == index))
+        let replacement = overrides.and_then(|list| list.iter().find(|item| item.index == index));
+        let (x, y, opacity, visible) = replacement
             .map(|item| (item.x, item.y, item.opacity, item.visible))
             .unwrap_or((layer.x, layer.y, layer.opacity, layer.visible));
         if !visible || opacity <= 0.0 {
             continue;
         }
-        blit_normal(&mut out, &layer.pixels, x, y, opacity);
+        let pixels = replacement
+            .and_then(|item| item.pixels.as_ref())
+            .unwrap_or(&layer.pixels);
+        blit_normal(&mut out, pixels, x, y, opacity);
     }
     out
 }
@@ -38,6 +41,8 @@ pub struct LayerOverride {
     pub y: i32,
     pub opacity: f32,
     pub visible: bool,
+    /// When set, these pixels are drawn instead of the layer's stored bitmap.
+    pub pixels: Option<RgbaImage>,
 }
 
 fn blit_normal(dst: &mut RgbaImage, src: &RgbaImage, origin_x: i32, origin_y: i32, opacity: f32) {

@@ -4,7 +4,8 @@ use super::canvas::{Canvas, CanvasInput};
 use super::dialogs;
 use super::layers::LayersPanel;
 use super::model::{
-    document_title, fit_view, jpeg_needs_white, widget_to_doc, CropDraft, Model, Preview, Tool,
+    active_bounds, doc_to_widget, document_title, fit_view, jpeg_needs_white, widget_to_doc,
+    CropDraft, Model, Preview, Tool,
 };
 use super::theme::{self, ThemeColors};
 use gtk::gdk;
@@ -12,8 +13,9 @@ use gtk::{gio, glib, prelude::*};
 use image::ImageReader;
 use libadwaita::prelude::*;
 use pixel::document::{
-    export, open_image, open_project, save_project, Axis, Command, Document, Editor, ExportFormat,
-    NewCanvas, QuarterTurn,
+    clockwise_delta, export, hit_handle, open_image, open_project, pointer_angle, resize_rect,
+    save_project, snap_angle, Axis, Command, Document, Editor, ExportFormat, Handle, NewCanvas,
+    PixelRect, QuarterTurn, ScaleFilter, HANDLE_RADIUS, ROTATE_OFFSET,
 };
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -52,9 +54,30 @@ struct Drag {
 
 #[derive(Clone)]
 enum DragKind {
-    Pan { pan_x: f64, pan_y: f64 },
-    Move { index: usize, x: i32, y: i32 },
-    Crop { ax: f64, ay: f64 },
+    Pan {
+        pan_x: f64,
+        pan_y: f64,
+    },
+    Move {
+        index: usize,
+        x: i32,
+        y: i32,
+    },
+    Resize {
+        index: usize,
+        handle: Handle,
+        origin: PixelRect,
+    },
+    Rotate {
+        index: usize,
+        cx: f64,
+        cy: f64,
+        start_angle: f64,
+    },
+    Crop {
+        ax: f64,
+        ay: f64,
+    },
 }
 
 enum Next {
@@ -620,7 +643,7 @@ impl Shell {
         match session.tool {
             Tool::Move => {
                 self.tool_options.append(&gtk::Label::new(Some(
-                    "Drag to move the active layer. Arrow keys nudge 1 px, Shift nudges 10.",
+                    "Drag the layer to move it. Handles resize it, and the round handle rotates it. Shift locks the aspect ratio, and snaps rotation to 45°. Arrow keys nudge 1 px, Shift nudges 10.",
                 )));
             }
             Tool::Crop => {
@@ -654,7 +677,7 @@ impl Shell {
                     "grab"
                 } else {
                     match session.tool {
-                        Tool::Move => "grab",
+                        Tool::Move => "default",
                         Tool::Crop => "crosshair",
                     }
                 }
@@ -1224,13 +1247,13 @@ impl Shell {
             }
             CanvasInput::Scroll { x, y, dy } => self.zoom_wheel(x, y, dy),
             CanvasInput::DragBegin { x, y, button } => self.begin_drag(x, y, button),
-            CanvasInput::DragUpdate { x, y } => self.update_drag(x, y),
-            CanvasInput::DragEnd { x, y } => self.end_drag(x, y),
+            CanvasInput::DragUpdate { x, y, shift } => self.update_drag(x, y, shift),
+            CanvasInput::DragEnd { x, y, shift } => self.end_drag(x, y, shift),
         }
     }
 
     fn track_cursor(&self, x: f64, y: f64) {
-        let text = {
+        let (text, cursor) = {
             let mut model = self.model.borrow_mut();
             let Some(session) = model.session.as_mut() else {
                 return;
@@ -1243,9 +1266,13 @@ impl Shell {
                 } else {
                     None
                 };
-            cursor_text(session.cursor)
+            let cursor = hover_cursor(session, x, y);
+            (cursor_text(session.cursor), cursor)
         };
         self.status_cursor.set_label(&text);
+        if let Some(cursor) = cursor {
+            self.canvas.set_cursor_from_name(Some(cursor));
+        }
     }
 
     fn zoom_wheel(&self, x: f64, y: f64, dy: f64) {
@@ -1287,19 +1314,11 @@ impl Shell {
             return;
         }
         let drag = match session.tool {
-            Tool::Move => {
-                let index = session.editor.document().active_index();
-                let layer = session.editor.document().active_layer();
-                Drag {
-                    kind: DragKind::Move {
-                        index,
-                        x: layer.x,
-                        y: layer.y,
-                    },
-                    origin_x: x,
-                    origin_y: y,
-                }
-            }
+            Tool::Move => Drag {
+                kind: move_drag(session, x, y),
+                origin_x: x,
+                origin_y: y,
+            },
             Tool::Crop => {
                 let (ax, ay) = widget_to_doc(session, x, y);
                 Drag {
@@ -1313,7 +1332,7 @@ impl Shell {
         *self.drag.borrow_mut() = Some(drag);
     }
 
-    fn update_drag(self: &Rc<Self>, x: f64, y: f64) {
+    fn update_drag(self: &Rc<Self>, x: f64, y: f64, shift: bool) {
         let Some(drag) = self.drag.borrow().clone() else {
             return;
         };
@@ -1323,6 +1342,57 @@ impl Shell {
                     session.pan_x = pan_x + (x - drag.origin_x);
                     session.pan_y = pan_y + (y - drag.origin_y);
                 }
+                self.canvas.queue_draw();
+            }
+            DragKind::Resize {
+                index,
+                handle,
+                origin,
+            } => {
+                let rect = {
+                    let model = self.model.borrow();
+                    let Some(session) = model.session.as_ref() else {
+                        return;
+                    };
+                    let (px, py) = widget_to_doc(session, x, y);
+                    resize_rect(origin, handle, px, py, shift)
+                };
+                let mut model = self.model.borrow_mut();
+                if let Some(session) = model.session.as_mut() {
+                    session.preview = Some(Preview::Resize {
+                        index,
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    });
+                    session.visual = session.visual.wrapping_add(1);
+                }
+                drop(model);
+                self.canvas.queue_draw();
+            }
+            DragKind::Rotate {
+                index,
+                cx,
+                cy,
+                start_angle,
+            } => {
+                let degrees = {
+                    let model = self.model.borrow();
+                    let Some(session) = model.session.as_ref() else {
+                        return;
+                    };
+                    rotation_degrees(session, cx, cy, start_angle, x, y, shift)
+                };
+                let mut model = self.model.borrow_mut();
+                if let Some(session) = model.session.as_mut() {
+                    session.preview = Some(Preview::Rotate {
+                        index,
+                        degrees_cw: degrees,
+                    });
+                    session.visual = session.visual.wrapping_add(1);
+                }
+                drop(model);
                 self.canvas.queue_draw();
             }
             DragKind::Move {
@@ -1372,7 +1442,7 @@ impl Shell {
         }
     }
 
-    fn end_drag(self: &Rc<Self>, x: f64, y: f64) {
+    fn end_drag(self: &Rc<Self>, x: f64, y: f64, shift: bool) {
         let Some(drag) = self.drag.borrow_mut().take() else {
             return;
         };
@@ -1398,6 +1468,52 @@ impl Shell {
                     index,
                     x: lx + dx,
                     y: ly + dy,
+                });
+            }
+            DragKind::Resize {
+                index,
+                handle,
+                origin,
+            } => {
+                let rect = {
+                    let model = self.model.borrow();
+                    let Some(session) = model.session.as_ref() else {
+                        return;
+                    };
+                    let (px, py) = widget_to_doc(session, x, y);
+                    resize_rect(origin, handle, px, py, shift)
+                };
+                if let Some(session) = self.model.borrow_mut().session.as_mut() {
+                    session.preview = None;
+                }
+                self.edit(Command::ScaleLayer {
+                    index,
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    filter: ScaleFilter::Lanczos3,
+                });
+            }
+            DragKind::Rotate {
+                index,
+                cx,
+                cy,
+                start_angle,
+            } => {
+                let degrees = {
+                    let model = self.model.borrow();
+                    let Some(session) = model.session.as_ref() else {
+                        return;
+                    };
+                    rotation_degrees(session, cx, cy, start_angle, x, y, shift)
+                };
+                if let Some(session) = self.model.borrow_mut().session.as_mut() {
+                    session.preview = None;
+                }
+                self.edit(Command::RotateLayer {
+                    index,
+                    degrees_cw: degrees,
                 });
             }
             DragKind::Crop { .. } => self.refresh(),
@@ -1540,6 +1656,93 @@ fn clear_box(box_: &gtk::Box) {
     while let Some(child) = box_.first_child() {
         box_.remove(&child);
     }
+}
+
+fn rotation_degrees(
+    session: &super::model::Session,
+    cx: f64,
+    cy: f64,
+    start_angle: f64,
+    x: f64,
+    y: f64,
+    shift: bool,
+) -> f32 {
+    let (px, py) = widget_to_doc(session, x, y);
+    let degrees = clockwise_delta(start_angle, pointer_angle(cx, cy, px, py));
+    if shift {
+        snap_angle(degrees, 45.0)
+    } else {
+        degrees
+    }
+}
+
+fn move_drag(session: &super::model::Session, x: f64, y: f64) -> DragKind {
+    let index = session.editor.document().active_index();
+    let bounds = active_bounds(session);
+    match hit_at(session, x, y) {
+        Some(Handle::Rotate) => {
+            let cx = bounds.x as f64 + bounds.width as f64 / 2.0;
+            let cy = bounds.y as f64 + bounds.height as f64 / 2.0;
+            let (px, py) = widget_to_doc(session, x, y);
+            DragKind::Rotate {
+                index,
+                cx,
+                cy,
+                start_angle: pointer_angle(cx, cy, px, py),
+            }
+        }
+        Some(handle) => DragKind::Resize {
+            index,
+            handle,
+            origin: bounds,
+        },
+        None => {
+            let layer = session.editor.document().active_layer();
+            DragKind::Move {
+                index,
+                x: layer.x,
+                y: layer.y,
+            }
+        }
+    }
+}
+
+fn pointer_inside_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
+    let bounds = active_bounds(session);
+    let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
+    let (right, bottom) = doc_to_widget(
+        session,
+        bounds.x as f64 + bounds.width as f64,
+        bounds.y as f64 + bounds.height as f64,
+    );
+    x >= left.min(right) && x <= left.max(right) && y >= top.min(bottom) && y <= top.max(bottom)
+}
+
+fn hit_at(session: &super::model::Session, x: f64, y: f64) -> Option<Handle> {
+    let bounds = active_bounds(session);
+    let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
+    let (right, bottom) = doc_to_widget(
+        session,
+        bounds.x as f64 + bounds.width as f64,
+        bounds.y as f64 + bounds.height as f64,
+    );
+    hit_handle(x, y, left, top, right, bottom, HANDLE_RADIUS, ROTATE_OFFSET)
+}
+
+fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'static str> {
+    let name = match session.tool {
+        Tool::Crop => "crosshair",
+        Tool::Move => match hit_at(session, x, y) {
+            Some(Handle::Rotate) => "crosshair",
+            Some(Handle::North | Handle::South) => "ns-resize",
+            Some(Handle::East | Handle::West) => "ew-resize",
+            Some(Handle::NorthWest | Handle::SouthEast) => "nwse-resize",
+            Some(Handle::NorthEast | Handle::SouthWest) => "nesw-resize",
+            None if pointer_inside_layer(session, x, y) || session.space_down => "grab",
+            None => "default",
+        },
+    };
+    Some(name)
 }
 
 fn cursor_text(cursor: Option<(i32, i32)>) -> String {

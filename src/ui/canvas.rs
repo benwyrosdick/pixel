@@ -1,18 +1,19 @@
 //! Pan, zoom, and draw the flattened document. Input is reported upward.
 
-use super::model::{rendered, Model, Session};
+use super::model::{active_bounds, doc_to_widget, rendered, Model, Session, Tool};
 use gtk::gdk;
 use gtk::glib;
 use gtk::graphene;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
+use pixel::document::{rotate_handle_point, ROTATE_OFFSET};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 
 pub enum CanvasInput {
     DragBegin { x: f64, y: f64, button: u32 },
-    DragUpdate { x: f64, y: f64 },
-    DragEnd { x: f64, y: f64 },
+    DragUpdate { x: f64, y: f64, shift: bool },
+    DragEnd { x: f64, y: f64, shift: bool },
     Motion { x: f64, y: f64 },
     Leave,
     Scroll { x: f64, y: f64, dy: f64 },
@@ -102,23 +103,31 @@ mod imp {
                 canvas.imp().emit(CanvasInput::DragBegin { x, y, button });
             });
             let canvas = obj.clone();
-            drag.connect_drag_update(move |_, dx, dy| {
+            drag.connect_drag_update(move |gesture, dx, dy| {
                 let Some((x0, y0)) = canvas.imp().drag_origin.get() else {
                     return;
                 };
+                let shift = gesture
+                    .current_event_state()
+                    .contains(gdk::ModifierType::SHIFT_MASK);
                 canvas.imp().emit(CanvasInput::DragUpdate {
                     x: x0 + dx,
                     y: y0 + dy,
+                    shift,
                 });
             });
             let canvas = obj.clone();
-            drag.connect_drag_end(move |_, dx, dy| {
+            drag.connect_drag_end(move |gesture, dx, dy| {
                 let Some((x0, y0)) = canvas.imp().drag_origin.take() else {
                     return;
                 };
+                let shift = gesture
+                    .current_event_state()
+                    .contains(gdk::ModifierType::SHIFT_MASK);
                 canvas.imp().emit(CanvasInput::DragEnd {
                     x: x0 + dx,
                     y: y0 + dy,
+                    shift,
                 });
             });
             obj.add_controller(drag);
@@ -186,6 +195,9 @@ mod imp {
                 snapshot.append_color(&color, &graphene::Rect::new(x + w - border, y, border, h));
             }
             snapshot.restore();
+            if session.tool == Tool::Move {
+                draw_handles(snapshot, session, model.accent);
+            }
         }
 
         fn document_texture(&self, session: &Session) -> gdk::MemoryTexture {
@@ -241,6 +253,75 @@ impl Canvas {
     pub fn set_handler(&self, handler: Rc<dyn Fn(CanvasInput)>) {
         *self.imp().handler.borrow_mut() = Some(handler);
     }
+}
+
+fn draw_handles(snapshot: &gtk::Snapshot, session: &Session, accent: (f32, f32, f32)) {
+    let bounds = active_bounds(session);
+    let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
+    let (right, bottom) = doc_to_widget(
+        session,
+        bounds.x as f64 + bounds.width as f64,
+        bounds.y as f64 + bounds.height as f64,
+    );
+    let (r, g, b) = accent;
+    let stroke = gdk::RGBA::new(r, g, b, 1.0);
+    let fill = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
+    stroke_rect(snapshot, left, top, right, bottom, &stroke);
+
+    let mid_x = (left + right) / 2.0;
+    let mid_y = (top + bottom) / 2.0;
+    let (rotate_x, rotate_y) = rotate_handle_point(left, top, right, bottom, ROTATE_OFFSET);
+    let (stem_y, stem_h) = if rotate_y < top {
+        (rotate_y, top - rotate_y)
+    } else {
+        (bottom, rotate_y - bottom)
+    };
+    snapshot.append_color(
+        &stroke,
+        &graphene::Rect::new(mid_x as f32 - 1.0, stem_y as f32, 2.0, stem_h as f32),
+    );
+    draw_knob(snapshot, rotate_x, rotate_y, &fill, &stroke);
+    for (x, y) in [
+        (left, top),
+        (mid_x, top),
+        (right, top),
+        (right, mid_y),
+        (right, bottom),
+        (mid_x, bottom),
+        (left, bottom),
+        (left, mid_y),
+    ] {
+        draw_knob(snapshot, x, y, &fill, &stroke);
+    }
+}
+
+fn stroke_rect(
+    snapshot: &gtk::Snapshot,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    color: &gdk::RGBA,
+) {
+    let width = (right - left).abs() as f32;
+    let height = (bottom - top).abs() as f32;
+    let x = left.min(right) as f32;
+    let y = top.min(bottom) as f32;
+    snapshot.append_color(color, &graphene::Rect::new(x, y, width, 1.0));
+    snapshot.append_color(color, &graphene::Rect::new(x, y + height - 1.0, width, 1.0));
+    snapshot.append_color(color, &graphene::Rect::new(x, y, 1.0, height));
+    snapshot.append_color(color, &graphene::Rect::new(x + width - 1.0, y, 1.0, height));
+}
+
+fn draw_knob(snapshot: &gtk::Snapshot, cx: f64, cy: f64, fill: &gdk::RGBA, stroke: &gdk::RGBA) {
+    let size = 11.0_f32;
+    let x = (cx as f32) - size / 2.0;
+    let y = (cy as f32) - size / 2.0;
+    snapshot.append_color(stroke, &graphene::Rect::new(x, y, size, size));
+    snapshot.append_color(
+        fill,
+        &graphene::Rect::new(x + 1.5, y + 1.5, size - 3.0, size - 3.0),
+    );
 }
 
 fn drag_button(gesture: &gtk::GestureDrag) -> u32 {

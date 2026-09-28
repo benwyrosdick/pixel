@@ -1,11 +1,17 @@
 //! A layered raster document and the undoable commands that edit it.
 
 mod composite;
+mod handles;
 mod io;
 mod ops;
 
 pub use composite::{composite, composite_with, LayerOverride};
+pub use handles::{
+    clockwise_delta, hit_handle, pointer_angle, resize_rect, rotate_handle_point, rotated_bounds,
+    snap_angle, Handle, PixelRect, HANDLE_RADIUS, ROTATE_OFFSET,
+};
 pub use io::{export, open_image, open_project, save_project, ExportFormat};
+pub use ops::rotate_bitmap;
 
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
@@ -318,6 +324,15 @@ pub enum Command {
         height: u32,
         filter: ScaleFilter,
     },
+    /// Resample one layer and place its top-left at `(x, y)`.
+    ScaleLayer {
+        index: usize,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        filter: ScaleFilter,
+    },
     RotateCanvas {
         turn: QuarterTurn,
     },
@@ -345,6 +360,7 @@ impl Command {
                 | Self::DeleteLayer { .. }
                 | Self::Crop { .. }
                 | Self::ScaleDocument { .. }
+                | Self::ScaleLayer { .. }
                 | Self::RotateCanvas { .. }
                 | Self::RotateLayer { .. }
                 | Self::FlipCanvas { .. }
@@ -568,6 +584,21 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             check_size(*width, *height)?;
             Ok(*width != doc.width || *height != doc.height)
         }
+        Command::ScaleLayer {
+            index,
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => {
+            let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            check_size(*width, *height)?;
+            Ok(layer.x != *x
+                || layer.y != *y
+                || layer.pixels.width() != *width
+                || layer.pixels.height() != *height)
+        }
         Command::Crop { width, height, .. } => {
             if *width == 0 || *height == 0 {
                 return Err(Error::EmptyCrop);
@@ -676,6 +707,14 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             height,
             filter,
         } => ops::scale_document(doc, width, height, filter.image_filter())?,
+        Command::ScaleLayer {
+            index,
+            x,
+            y,
+            width,
+            height,
+            filter,
+        } => ops::scale_layer(doc, index, x, y, width, height, filter.image_filter())?,
         Command::RotateCanvas { turn } => ops::rotate_canvas(doc, turn),
         Command::RotateLayer { index, degrees_cw } => ops::rotate_layer(doc, index, degrees_cw)?,
         Command::FlipCanvas { axis } => ops::flip_canvas(doc, axis),
@@ -1103,5 +1142,53 @@ mod tests {
         assert_eq!(after[2], names[0]);
         assert_eq!(editor.document().active_layer().id, active_id);
         assert_ne!(editor.document().active_index(), 2);
+    }
+
+    #[test]
+    fn scale_layer_resamples_one_layer_and_keeps_the_given_origin() {
+        let mut editor = doc_with(8, 8, (0, 0), rgba(255, 0, 0, 255));
+        editor
+            .apply(Command::ScaleLayer {
+                index: 0,
+                x: 2,
+                y: 3,
+                width: 4,
+                height: 4,
+                filter: ScaleFilter::Nearest,
+            })
+            .unwrap();
+        let layer = &editor.document().layers()[0];
+        assert_eq!((layer.x, layer.y), (2, 3));
+        assert_eq!((layer.width(), layer.height()), (4, 4));
+        assert_eq!((editor.document().width, editor.document().height), (8, 8));
+        assert!(editor.undo());
+        assert_eq!(editor.document().layers()[0].width(), 8);
+    }
+
+    #[test]
+    fn rotating_a_wide_layer_sideways_does_not_overflow() {
+        let mut editor = Editor::new(
+            Document::new(NewCanvas {
+                width: 16,
+                height: 16,
+                ppi: 72.0,
+                background: Background::Transparent,
+            })
+            .unwrap(),
+        );
+        let mut image = image::RgbaImage::new(8, 2);
+        image.put_pixel(0, 0, rgba(255, 0, 0, 255));
+        editor.doc.layers[0].pixels = image;
+        editor
+            .apply(Command::RotateLayer {
+                index: 0,
+                degrees_cw: 90.0,
+            })
+            .unwrap();
+        let layer = &editor.document().layers()[0];
+        assert!(layer.height() > layer.width());
+        assert!(layer.pixels.pixels().any(|pixel| pixel[3] > 0));
+        let (pixels, _, _) = rotate_bitmap(&layer.pixels, 0, 0, f32::NAN);
+        assert_eq!(pixels.dimensions(), layer.pixels.dimensions());
     }
 }
