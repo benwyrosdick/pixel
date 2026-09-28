@@ -21,7 +21,12 @@ pub struct LayersPanel {
 impl LayersPanel {
     pub fn new() -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        root.set_width_request(260);
+        // Child scales want to expand. Pin that here so the panel stays a
+        // fixed column until the splitter is dragged.
+        root.set_hexpand(false);
+        root.set_hexpand_set(true);
+        root.set_vexpand(true);
+        root.set_width_request(200);
         root.set_margin_top(8);
         root.set_margin_bottom(8);
         root.set_margin_start(8);
@@ -38,6 +43,8 @@ impl LayersPanel {
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroller.set_vexpand(true);
+        scroller.set_hexpand(true);
+        scroller.set_propagate_natural_width(false);
         scroller.set_child(Some(&list));
         root.append(&scroller);
 

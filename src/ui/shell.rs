@@ -102,13 +102,39 @@ impl Shell {
         let tools = gtk::Box::new(gtk::Orientation::Vertical, 0);
         tools.add_css_class("pixel-panel");
         tools.set_width_request(76);
+        tools.set_hexpand(false);
+        tools.set_hexpand_set(true);
+        tools.set_vexpand(true);
         tools.append(&move_tool);
         tools.append(&crop_tool);
 
+        let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+        split.add_css_class("pixel-split");
+        split.set_hexpand(true);
+        split.set_vexpand(true);
+        split.set_wide_handle(true);
+        split.set_resize_start_child(true);
+        split.set_resize_end_child(false);
+        split.set_shrink_start_child(true);
+        split.set_shrink_end_child(false);
+        split.set_start_child(Some(&canvas));
+        split.set_end_child(Some(&layers.root));
+        let split_placed = Cell::new(false);
+        split.connect_notify_local(Some("width"), move |split, _| {
+            if split_placed.get() {
+                return;
+            }
+            let width = split.width();
+            if width < 480 {
+                return;
+            }
+            split_placed.set(true);
+            split.set_position(width - 260);
+        });
+
         let editor = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         editor.append(&tools);
-        editor.append(&canvas);
-        editor.append(&layers.root);
+        editor.append(&split);
 
         let (welcome, new_canvas, open_image, open_project) = welcome_page();
         let stack = gtk::Stack::new();

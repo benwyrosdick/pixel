@@ -85,6 +85,10 @@ impl ThemeColors {
             row.pixel-layer:selected {{
               background-color: {selection};
             }}
+            paned.pixel-split > separator {{
+              background-color: {muted};
+              min-width: 8px;
+            }}
             "#,
             bg = self.background,
             fg = self.foreground,
@@ -93,6 +97,7 @@ impl ThemeColors {
             muted_fg = self.dark_foreground,
             accent = self.accent,
             selection = self.selection,
+            muted = self.muted,
         )
     }
 

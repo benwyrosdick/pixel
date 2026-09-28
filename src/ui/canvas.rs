@@ -92,17 +92,18 @@ mod imp {
             let obj = self.obj();
             let drag = gtk::GestureDrag::new();
             drag.set_button(0);
-            let origin = self.drag_origin.clone();
+            drag.set_exclusive(true);
+            // Cell::clone copies the value into a new cell. All three handlers
+            // have to share the widget's cell or the drag never updates.
             let canvas = obj.clone();
             drag.connect_drag_begin(move |gesture, x, y| {
-                origin.set(Some((x, y)));
-                let button = gesture.current_button();
+                canvas.imp().drag_origin.set(Some((x, y)));
+                let button = drag_button(gesture);
                 canvas.imp().emit(CanvasInput::DragBegin { x, y, button });
             });
-            let origin = self.drag_origin.clone();
             let canvas = obj.clone();
             drag.connect_drag_update(move |_, dx, dy| {
-                let Some((x0, y0)) = origin.get() else {
+                let Some((x0, y0)) = canvas.imp().drag_origin.get() else {
                     return;
                 };
                 canvas.imp().emit(CanvasInput::DragUpdate {
@@ -110,10 +111,9 @@ mod imp {
                     y: y0 + dy,
                 });
             });
-            let origin = self.drag_origin.clone();
             let canvas = obj.clone();
             drag.connect_drag_end(move |_, dx, dy| {
-                let Some((x0, y0)) = origin.take() else {
+                let Some((x0, y0)) = canvas.imp().drag_origin.take() else {
                     return;
                 };
                 canvas.imp().emit(CanvasInput::DragEnd {
@@ -240,6 +240,21 @@ impl Canvas {
 
     pub fn set_handler(&self, handler: Rc<dyn Fn(CanvasInput)>) {
         *self.imp().handler.borrow_mut() = Some(handler);
+    }
+}
+
+fn drag_button(gesture: &gtk::GestureDrag) -> u32 {
+    let button = gesture.current_button();
+    if button != 0 {
+        return button;
+    }
+    let state = gesture.current_event_state();
+    if state.contains(gdk::ModifierType::BUTTON2_MASK) {
+        gdk::BUTTON_MIDDLE
+    } else if state.contains(gdk::ModifierType::BUTTON3_MASK) {
+        gdk::BUTTON_SECONDARY
+    } else {
+        gdk::BUTTON_PRIMARY
     }
 }
 
