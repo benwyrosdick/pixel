@@ -48,6 +48,9 @@ mod imp {
             obj.set_vexpand(true);
             obj.set_focusable(true);
             obj.set_can_focus(true);
+            // Widgets don't clip their own drawing. A panned document would
+            // otherwise paint over the splitter and the layers panel.
+            obj.set_overflow(gtk::Overflow::Hidden);
             obj.add_css_class("pixel-canvas");
             self.install_input();
         }
