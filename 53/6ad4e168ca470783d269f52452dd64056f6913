@@ -1,0 +1,26 @@
+src/document/composite.rs
+  h_4d9554034adb05 23-24,30-33,44-45
+src/document/handles.rs
+  h_4d9554034adb05 1-290
+src/document/mod.rs
+  h_4d9554034adb05 4,9-12,14,327-335,363,587-601,710-717,1146-1193
+src/document/ops.rs
+  h_4d9554034adb05 150-168,240-253,256-259,261-295,297-302,306-321
+src/ui/canvas.rs
+  h_4d9554034adb05 3,9,15-16,106,110-112,116,120,124-126,130,198-200,258-326
+src/ui/model.rs
+  h_4d9554034adb05 4-7,24-43,108-118,120-122,124-153,156,161-199,219-225
+src/ui/shell.rs
+  h_4d9554034adb05 7-8,16-18,57-80,646,680,1250-1251,1256,1269-1270,1273-1275,1317-1321,1335,1347-1397,1445,1473-1518,1661-1747
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "536ad4e168ca470783d269f52452dd64056f6913",
+  "prompts": {},
+  "humans": {
+    "h_4d9554034adb05": {
+      "author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
