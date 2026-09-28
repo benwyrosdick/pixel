@@ -17,14 +17,10 @@ cargo run --release -- photo.png
 ## Install locally
 
 ```bash
-cargo build --release
-install -Dm755 target/release/pixel ~/.local/bin/pixel
-install -Dm644 assets/pixel.desktop ~/.local/share/applications/pixel.desktop
-install -Dm644 assets/pixel.svg ~/.local/share/icons/hicolor/scalable/apps/pixel.svg
-install -Dm644 assets/pixel.xml ~/.local/share/mime/packages/pixel.xml
-update-desktop-database ~/.local/share/applications
-update-mime-database ~/.local/share/mime
+just install
 ```
+
+This builds a release binary and installs it to `~/.local/bin`, with its desktop entry, icon, and `.pixel` file type under `~/.local/share`. `just uninstall` removes them. Run `just` to list the other recipes.
 
 The window reads `~/.local/state/omarchy/current/theme/colors.toml` and follows the active Omarchy theme. If that file is missing, it uses a dark fallback.
 
