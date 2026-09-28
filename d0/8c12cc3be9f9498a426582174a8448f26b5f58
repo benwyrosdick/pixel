@@ -1,0 +1,14 @@
+src/ui/layers.rs
+  h_4d9554034adb05 235-320,323,326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d08c12cc3be9f9498a426582174a8448f26b5f58",
+  "prompts": {},
+  "humans": {
+    "h_4d9554034adb05": {
+      "author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
