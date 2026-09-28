@@ -2199,8 +2199,9 @@ fn select_on_release(
     debug_assert!(result.is_ok(), "picked layers come from the document");
 }
 
-/// Update the selection for a move-tool press. A layer under the pointer is
-/// selected alone unless it is already part of the selection. The handles and
+/// Update the selection for a move-tool press. The unlocked layer under the
+/// pointer is selected alone unless it is already part of the selection.
+/// Locked layers can't move, so the press looks through them. The handles and
 /// the boxes of selected layers keep the selection, so a layer with
 /// transparent areas can still be grabbed. A press on nothing deselects.
 /// Returns whether the selection changed.
@@ -2210,7 +2211,7 @@ fn select_under_pointer(session: &mut super::model::Session, x: f64, y: f64) -> 
     }
     let (dx, dy) = widget_to_doc(session, x, y);
     let doc = session.editor.document();
-    match doc.layer_at(dx, dy) {
+    match doc.unlocked_layer_at(dx, dy) {
         Some(index) if doc.is_selected(index) => false,
         Some(index) => session.editor.set_active(index).is_ok(),
         None if pointer_in_selection(session, x, y) => false,
@@ -2286,7 +2287,11 @@ fn pointer_in_bounds(session: &super::model::Session, bounds: PixelRect, x: f64,
 
 fn pointer_on_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
     let (dx, dy) = widget_to_doc(session, x, y);
-    session.editor.document().layer_at(dx, dy).is_some()
+    session
+        .editor
+        .document()
+        .unlocked_layer_at(dx, dy)
+        .is_some()
 }
 
 /// A locked layer has no handles, so this is `None` for one.

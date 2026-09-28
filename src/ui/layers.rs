@@ -168,12 +168,23 @@ impl LayersPanel {
 
     pub fn sync(&self, shell: &Rc<Shell>, session: &Session) {
         self.updating.set(true);
+        let focused = self.focused_row();
         while let Some(row) = self.list.row_at_index(0) {
             self.list.remove(&row);
         }
         let doc = session.editor.document();
         for (index, layer) in doc.layers().iter().enumerate().rev() {
             self.list.append(&layer_row(shell, index, layer));
+        }
+        // Removing the focused row makes GTK move focus back into the list
+        // later, and a row that gains focus that way gets selected. That
+        // selection would arrive after this sync and undo the document's.
+        // Focusing the new row now, while updates are ignored, prevents it.
+        if let Some(visual) = focused {
+            let last = self.list.observe_children().n_items().saturating_sub(1) as i32;
+            if let Some(row) = self.list.row_at_index(visual.min(last)) {
+                row.grab_focus();
+            }
         }
         self.list.unselect_all();
         for index in doc.selected_indices() {
@@ -197,6 +208,20 @@ impl LayersPanel {
             .delete
             .set_sensitive(!doc.selected_indices().is_empty());
         self.updating.set(false);
+    }
+
+    /// The position of the row that has keyboard focus, or holds the widget
+    /// that does.
+    fn focused_row(&self) -> Option<i32> {
+        let focus = self.list.root()?.focus()?;
+        let mut index = 0;
+        while let Some(row) = self.list.row_at_index(index) {
+            if focus == *row.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&row) {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
     }
 
     pub fn clear(&self) {

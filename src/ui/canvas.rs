@@ -101,6 +101,9 @@ mod imp {
             // have to share the widget's cell or the drag never updates.
             let canvas = obj.clone();
             drag.connect_drag_begin(move |gesture, x, y| {
+                // Take keyboard focus, so keys act on the canvas rather than
+                // whatever was last clicked, such as a layer row.
+                canvas.grab_focus();
                 canvas.imp().drag_origin.set(Some((x, y)));
                 let button = drag_button(gesture);
                 canvas.imp().emit(CanvasInput::DragBegin { x, y, button });

@@ -127,7 +127,8 @@ pub struct Layer {
     pub name: String,
     pub visible: bool,
     /// A locked layer's pixels, placement, and opacity can't be edited, and
-    /// the canvas won't pick it. Canvas-wide edits still apply to it.
+    /// the move tool passes over it. It can still be selected, copied, and
+    /// duplicated. Canvas-wide edits still apply to it.
     pub locked: bool,
     pub opacity: f32,
     pub blend: BlendMode,
@@ -249,15 +250,25 @@ impl Document {
         Ok(())
     }
 
-    /// The topmost visible, unlocked layer with a non-transparent pixel at a
-    /// document point. Pixels outside the canvas are not drawn, so they never hit.
+    /// The topmost visible layer with a non-transparent pixel at a document
+    /// point. Pixels outside the canvas are not drawn, so they never hit.
     pub fn layer_at(&self, x: f64, y: f64) -> Option<usize> {
+        self.topmost_at(x, y, true)
+    }
+
+    /// Like [`Document::layer_at`], but looks through locked layers to the
+    /// ones under them. The move tool picks with this.
+    pub fn unlocked_layer_at(&self, x: f64, y: f64) -> Option<usize> {
+        self.topmost_at(x, y, false)
+    }
+
+    fn topmost_at(&self, x: f64, y: f64, include_locked: bool) -> Option<usize> {
         if !(x >= 0.0 && y >= 0.0 && x < self.width as f64 && y < self.height as f64) {
             return None;
         }
         let (px, py) = (x.floor() as i64, y.floor() as i64);
         self.layers.iter().rposition(|layer| {
-            if !layer.visible || layer.locked || layer.opacity <= 0.0 {
+            if !layer.visible || (layer.locked && !include_locked) || layer.opacity <= 0.0 {
                 return false;
             }
             let lx = px - layer.x as i64;
@@ -270,15 +281,15 @@ impl Document {
         })
     }
 
-    /// Visible, unlocked layers whose drawn pixels all fall inside `area`.
-    /// Only pixels on the canvas count, and a layer with none is skipped.
+    /// Visible layers whose drawn pixels all fall inside `area`. Only pixels on
+    /// the canvas count, and a layer with none is skipped.
     pub fn layers_within(&self, area: PixelRect) -> Vec<usize> {
         let (ax0, ay0) = (area.x as i64, area.y as i64);
         let (ax1, ay1) = (ax0 + area.width as i64, ay0 + area.height as i64);
         (0..self.layers.len())
             .filter(|&index| {
                 let layer = &self.layers[index];
-                if !layer.visible || layer.locked || layer.opacity <= 0.0 {
+                if !layer.visible || layer.opacity <= 0.0 {
                     return false;
                 }
                 let (ox, oy) = (layer.x as i64, layer.y as i64);
@@ -1266,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn layers_within_skips_empty_hidden_and_locked_layers_and_clips_to_the_canvas() {
+    fn layers_within_skips_empty_and_hidden_layers_and_clips_to_the_canvas() {
         let mut editor = three_layers();
         editor.apply(Command::AddLayer).unwrap();
         editor
@@ -1280,18 +1291,24 @@ mod tests {
             vec![0, 2]
         );
 
-        editor
-            .apply(Command::SetLocked {
-                index: 0,
-                locked: true,
-            })
-            .unwrap();
         editor.doc.layers[2].x = 7;
         assert_eq!(
             editor.document().layers_within(area(6, 4, 2, 4)),
             vec![2],
             "the part of the square off the canvas does not count"
         );
+    }
+
+    #[test]
+    fn layers_within_includes_locked_layers() {
+        let mut editor = three_layers();
+        editor
+            .apply(Command::SetLocked {
+                index: 1,
+                locked: true,
+            })
+            .unwrap();
+        assert_eq!(editor.document().layers_within(area(0, 0, 4, 4)), vec![1]);
     }
 
     #[test]
@@ -1451,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_at_passes_through_locked_layers() {
+    fn only_the_unlocked_pick_passes_through_locked_layers() {
         let mut editor = doc_with(2, 2, (0, 0), rgba(255, 0, 0, 255));
         editor.apply(Command::AddLayer).unwrap();
         editor.doc.layers[1]
@@ -1463,7 +1480,8 @@ mod tests {
                 locked: true,
             })
             .unwrap();
-        assert_eq!(editor.document().layer_at(0.0, 0.0), Some(0));
+        assert_eq!(editor.document().layer_at(0.0, 0.0), Some(1));
+        assert_eq!(editor.document().unlocked_layer_at(0.0, 0.0), Some(0));
     }
 
     #[test]
