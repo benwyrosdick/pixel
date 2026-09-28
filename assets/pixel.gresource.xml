@@ -9,5 +9,8 @@
     <file>pixel-align-right-symbolic.svg</file>
     <file>pixel-distribute-horizontal-symbolic.svg</file>
     <file>pixel-distribute-vertical-symbolic.svg</file>
+    <file>pixel-tool-select-symbolic.svg</file>
+    <file>pixel-tool-move-symbolic.svg</file>
+    <file>pixel-tool-crop-symbolic.svg</file>
   </gresource>
 </gresources>

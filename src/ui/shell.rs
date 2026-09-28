@@ -122,9 +122,9 @@ impl Shell {
         canvas.set_model(model.clone());
         let layers = LayersPanel::new();
 
-        let select_tool = tool_button("Select");
-        let move_tool = tool_button("Move");
-        let crop_tool = tool_button("Crop");
+        let select_tool = tool_button("Select", "select", "V");
+        let move_tool = tool_button("Move", "move", "M");
+        let crop_tool = tool_button("Crop", "crop", "C");
         move_tool.set_group(Some(&select_tool));
         crop_tool.set_group(Some(&select_tool));
         select_tool.set_active(true);
@@ -138,6 +138,19 @@ impl Shell {
         tools.append(&move_tool);
         tools.append(&crop_tool);
 
+        let tool_options = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        tool_options.add_css_class("pixel-toolbar");
+        tool_options.set_margin_top(4);
+        tool_options.set_margin_bottom(4);
+        tool_options.set_margin_start(8);
+        tool_options.set_margin_end(8);
+
+        // The tool hints sit under the canvas, inside its pane, so they share
+        // its width rather than running under the tools and layers.
+        let canvas_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        canvas_pane.append(&canvas);
+        canvas_pane.append(&tool_options);
+
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         split.add_css_class("pixel-split");
         split.set_hexpand(true);
@@ -147,7 +160,7 @@ impl Shell {
         split.set_resize_end_child(false);
         split.set_shrink_start_child(true);
         split.set_shrink_end_child(false);
-        split.set_start_child(Some(&canvas));
+        split.set_start_child(Some(&canvas_pane));
         split.set_end_child(Some(&layers.root));
         let split_placed = Cell::new(false);
         split.connect_notify_local(Some("width"), move |split, _| {
@@ -171,13 +184,6 @@ impl Shell {
         stack.add_named(&welcome, Some("welcome"));
         stack.add_named(&editor, Some("editor"));
 
-        let tool_options = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        tool_options.add_css_class("pixel-toolbar");
-        tool_options.set_margin_top(4);
-        tool_options.set_margin_bottom(4);
-        tool_options.set_margin_start(8);
-        tool_options.set_margin_end(8);
-
         let title = gtk::Label::new(Some("Pixel"));
         let undo_btn = gtk::Button::from_icon_name("edit-undo-symbolic");
         undo_btn.set_tooltip_text(Some("Undo"));
@@ -198,7 +204,6 @@ impl Shell {
         let top = gtk::Box::new(gtk::Orientation::Vertical, 0);
         top.append(&header);
         top.append(&menu_bar);
-        top.append(&tool_options);
 
         let status_size = gtk::Label::new(None);
         let status_cursor = gtk::Label::new(None);
@@ -720,18 +725,17 @@ impl Shell {
         };
         match session.tool {
             Tool::Select => {
-                self.tool_options.append(&gtk::Label::new(Some(
+                self.tool_options.append(&hint_label(
                     "Click a layer to select it, or Shift-click to add or remove it. Drag a box around layers to select them, with Shift to add them.",
-                )));
+                ));
             }
             Tool::Move => {
-                self.tool_options.append(&gtk::Label::new(Some(
+                self.tool_options.append(&hint_label(
                     "Drag the selection to move it. With one layer selected, handles resize it and the round handle rotates it. Shift locks the aspect ratio, and snaps rotation to 45°. Arrow keys nudge 1 px, Shift nudges 10.",
-                )));
+                ));
             }
             Tool::Crop => {
-                let label = gtk::Label::new(Some(&crop_hint(session.crop)));
-                label.set_xalign(0.0);
+                let label = hint_label(&crop_hint(session.crop));
                 self.tool_options.append(&label);
                 *self.crop_label.borrow_mut() = Some(label);
                 let apply = gtk::Button::with_label("Apply crop");
@@ -1807,8 +1811,27 @@ fn icon_row(title: &str, items: &[(&str, &str)]) -> gio::MenuItem {
     section
 }
 
-fn tool_button(label: &str) -> gtk::ToggleButton {
-    let button = gtk::ToggleButton::with_label(label);
+/// Tool hint text. It wraps so it never holds the canvas pane open wider than
+/// the splitter puts it.
+fn hint_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_hexpand(true);
+    label
+}
+
+/// A toolbar button with the `pixel-tool-<icon>-symbolic` icon over its label.
+fn tool_button(label: &str, icon: &str, key: &str) -> gtk::ToggleButton {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let image = gtk::Image::from_icon_name(&format!("pixel-tool-{icon}-symbolic"));
+    image.set_pixel_size(20);
+    content.append(&image);
+    content.append(&gtk::Label::new(Some(label)));
+    let button = gtk::ToggleButton::new();
+    button.set_child(Some(&content));
+    button.set_tooltip_text(Some(&format!("{label} ({key})")));
     button.add_css_class("pixel-tool");
     button
 }
