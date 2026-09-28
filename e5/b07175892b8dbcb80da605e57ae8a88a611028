@@ -1,0 +1,23 @@
+README.md
+  s_e5d054807dbd83::t_0067c77a87a98c 20,23
+  s_e5d054807dbd83::t_dd30bccaf2e391 24
+Justfile
+  s_e5d054807dbd83::t_2d2c81161c7f62 1-8,10,12-34
+  s_e5d054807dbd83::t_ac0964c0e2fd8c 9,11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e5b07175892b8dbcb80da605e57ae8a88a611028",
+  "prompts": {},
+  "sessions": {
+    "s_e5d054807dbd83": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "37717b74-9e79-4f0a-8b2b-5900e74441c5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
