@@ -102,6 +102,7 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
             id: layer.id,
             name: layer.name.clone(),
             visible: layer.visible,
+            locked: layer.locked,
             opacity: layer.opacity.clamp(0.0, 1.0),
             blend: layer.blend,
             x: layer.x,
@@ -147,6 +148,9 @@ struct LayerSer {
     id: u64,
     name: String,
     visible: bool,
+    /// Missing from projects saved before layers could be locked.
+    #[serde(default)]
+    locked: bool,
     opacity: f32,
     blend: BlendMode,
     x: i32,
@@ -190,6 +194,7 @@ impl Manifest {
                     id: layer.id,
                     name: layer.name.clone(),
                     visible: layer.visible,
+                    locked: layer.locked,
                     opacity: layer.opacity,
                     blend: layer.blend,
                     x: layer.x,
@@ -364,6 +369,27 @@ mod tests {
             editor.document().layers()[0].pixels
         );
         assert_eq!(composite(&opened), composite(editor.document()));
+    }
+
+    #[test]
+    fn project_roundtrip_keeps_the_lock_and_reads_older_manifests_as_unlocked() {
+        let mut editor = Editor::new(sample_doc());
+        editor
+            .apply(Command::SetLocked {
+                index: 0,
+                locked: true,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        assert!(open_project(&path).unwrap().layers()[0].locked);
+
+        let old: LayerSer = serde_json::from_str(
+            r#"{"id":1,"name":"Layer 1","visible":true,"opacity":1.0,"blend":"Normal","x":0,"y":0,"file":"layer-000.png"}"#,
+        )
+        .unwrap();
+        assert!(!old.locked);
     }
 
     #[test]

@@ -565,6 +565,10 @@ impl Shell {
             self.enable("undo", session.editor.can_undo());
             self.enable("redo", session.editor.can_redo());
             self.enable_document_actions(true);
+            let locked = doc.active_layer().locked;
+            for name in ["rotate-layer", "flip-layer-h", "flip-layer-v"] {
+                self.enable(name, !locked);
+            }
             drop(model);
             self.fill_tool_options();
             let model = self.model.borrow();
@@ -1195,9 +1199,9 @@ impl Shell {
     }
 
     fn nudge(self: &Rc<Self>, dx: i32, dy: i32) {
-        let Some((index, x, y)) = self.model.borrow().session.as_ref().map(|session| {
+        let Some((index, x, y)) = self.model.borrow().session.as_ref().and_then(|session| {
             let layer = session.editor.document().active_layer();
-            (session.editor.document().active_index(), layer.x, layer.y)
+            (!layer.locked).then(|| (session.editor.document().active_index(), layer.x, layer.y))
         }) else {
             return;
         };
@@ -1317,6 +1321,13 @@ impl Shell {
         let drag = match session.tool {
             Tool::Move => {
                 selected = select_under_pointer(session, x, y);
+                if session.editor.document().active_layer().locked {
+                    drop(model);
+                    if selected {
+                        self.refresh();
+                    }
+                    return;
+                }
                 Drag {
                     kind: move_drag(session, x, y),
                     origin_x: x,
@@ -1745,7 +1756,11 @@ fn pointer_on_layer(session: &super::model::Session, x: f64, y: f64) -> bool {
     session.editor.document().layer_at(dx, dy).is_some()
 }
 
+/// A locked layer has no handles, so this is `None` for one.
 fn hit_at(session: &super::model::Session, x: f64, y: f64) -> Option<Handle> {
+    if session.editor.document().active_layer().locked {
+        return None;
+    }
     let bounds = active_bounds(session);
     let (left, top) = doc_to_widget(session, bounds.x as f64, bounds.y as f64);
     let (right, bottom) = doc_to_widget(
@@ -1765,11 +1780,13 @@ fn hover_cursor(session: &super::model::Session, x: f64, y: f64) -> Option<&'sta
             Some(Handle::East | Handle::West) => "ew-resize",
             Some(Handle::NorthWest | Handle::SouthEast) => "nwse-resize",
             Some(Handle::NorthEast | Handle::SouthWest) => "nesw-resize",
-            None if pointer_inside_layer(session, x, y)
-                || pointer_on_layer(session, x, y)
-                || session.space_down =>
-            {
-                "grab"
+            None if session.space_down || pointer_on_layer(session, x, y) => "grab",
+            None if pointer_inside_layer(session, x, y) => {
+                if session.editor.document().active_layer().locked {
+                    "not-allowed"
+                } else {
+                    "grab"
+                }
             }
             None => "default",
         },

@@ -181,6 +181,7 @@ impl LayersPanel {
             let opacity = doc.active_layer().opacity * 100.0;
             self.opacity.set_value(opacity as f64);
         }
+        self.opacity.set_sensitive(!doc.active_layer().locked);
         self.updating.set(false);
     }
 
@@ -190,6 +191,20 @@ impl LayersPanel {
             self.list.remove(&row);
         }
         self.updating.set(false);
+    }
+}
+
+/// Unlocked rows show a faint open padlock so the toggle is discoverable
+/// without competing with the name.
+fn show_lock(button: &gtk::ToggleButton, locked: bool) {
+    if locked {
+        button.set_icon_name("changes-prevent-symbolic");
+        button.set_tooltip_text(Some("Unlock layer"));
+        button.set_opacity(1.0);
+    } else {
+        button.set_icon_name("changes-allow-symbolic");
+        button.set_tooltip_text(Some("Lock layer"));
+        button.set_opacity(0.45);
     }
 }
 
@@ -229,6 +244,19 @@ fn layer_row(shell: &Rc<Shell>, index: usize, layer: &Layer) -> gtk::ListBoxRow 
         let shell = shell_eye.clone();
         glib::idle_add_local_once(move || {
             shell.edit(Command::SetVisibility { index, visible });
+        });
+    });
+
+    let lock = gtk::ToggleButton::new();
+    lock.set_active(layer.locked);
+    show_lock(&lock, layer.locked);
+    let shell_lock = shell.clone();
+    lock.connect_toggled(move |button| {
+        let locked = button.is_active();
+        show_lock(button, locked);
+        let shell = shell_lock.clone();
+        glib::idle_add_local_once(move || {
+            shell.edit(Command::SetLocked { index, locked });
         });
     });
 
@@ -312,17 +340,22 @@ fn layer_row(shell: &Rc<Shell>, index: usize, layer: &Layer) -> gtk::ListBoxRow 
     });
     entry.add_controller(keys);
 
-    let eye_for_hit = eye.clone();
+    let row_for_hit = row.clone();
+    let name_for_hit = name_box.clone();
     let rename_click = gtk::GestureClick::new();
     rename_click.set_button(gdk::BUTTON_PRIMARY);
     rename_click.connect_pressed(move |_, n_press, x, _| {
-        if n_press == 2 && x > f64::from(eye_for_hit.width().max(1) + 12) {
+        let on_name = name_for_hit
+            .compute_bounds(&row_for_hit)
+            .is_some_and(|bounds| x >= f64::from(bounds.x()));
+        if n_press == 2 && on_name {
             begin_edit();
         }
     });
     row.add_controller(rename_click);
 
     content.append(&eye);
+    content.append(&lock);
     content.append(&name_box);
     row.set_child(Some(&content));
 

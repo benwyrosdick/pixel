@@ -198,7 +198,7 @@ mod imp {
                 snapshot.append_color(&color, &graphene::Rect::new(x + w - border, y, border, h));
             }
             snapshot.restore();
-            if session.tool == Tool::Move {
+            if session.tool == Tool::Move && !doc.active_layer().locked {
                 draw_handles(snapshot, session, model.accent);
             }
         }

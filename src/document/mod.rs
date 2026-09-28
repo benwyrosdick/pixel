@@ -40,6 +40,8 @@ pub enum Error {
     Write(String),
     #[error("that file is not a Pixel project")]
     BadProject,
+    #[error("the layer is locked")]
+    Locked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +113,9 @@ pub struct Layer {
     pub id: u64,
     pub name: String,
     pub visible: bool,
+    /// A locked layer's pixels, placement, and opacity can't be edited, and
+    /// the canvas won't pick it. Canvas-wide edits still apply to it.
+    pub locked: bool,
     pub opacity: f32,
     pub blend: BlendMode,
     pub x: i32,
@@ -203,15 +208,15 @@ impl Document {
         &self.layers[self.active]
     }
 
-    /// The topmost visible layer with a non-transparent pixel at a document
-    /// point. Pixels outside the canvas are not drawn, so they never hit.
+    /// The topmost visible, unlocked layer with a non-transparent pixel at a
+    /// document point. Pixels outside the canvas are not drawn, so they never hit.
     pub fn layer_at(&self, x: f64, y: f64) -> Option<usize> {
         if !(x >= 0.0 && y >= 0.0 && x < self.width as f64 && y < self.height as f64) {
             return None;
         }
         let (px, py) = (x.floor() as i64, y.floor() as i64);
         self.layers.iter().rposition(|layer| {
-            if !layer.visible || layer.opacity <= 0.0 {
+            if !layer.visible || layer.locked || layer.opacity <= 0.0 {
                 return false;
             }
             let lx = px - layer.x as i64;
@@ -285,6 +290,7 @@ fn blank_layer(doc: &mut Document, name: &str) -> Layer {
         id,
         name: name.to_string(),
         visible: true,
+        locked: false,
         opacity: 1.0,
         blend: BlendMode::Normal,
         x: 0,
@@ -319,6 +325,10 @@ pub enum Command {
     SetVisibility {
         index: usize,
         visible: bool,
+    },
+    SetLocked {
+        index: usize,
+        locked: bool,
     },
     SetOpacity {
         index: usize,
@@ -395,6 +405,7 @@ struct GeomLayer {
     id: u64,
     name: String,
     visible: bool,
+    locked: bool,
     opacity: f32,
     blend: BlendMode,
     x: i32,
@@ -457,6 +468,7 @@ impl Editor {
         if !command_changes(&self.doc, &command)? {
             return Ok(false);
         }
+        check_unlocked(&self.doc, &command)?;
         let entry = if command.touches_pixels() {
             UndoEntry::Pixels(self.doc.clone())
         } else {
@@ -512,6 +524,7 @@ fn geom_snap(doc: &Document) -> GeomSnap {
                 id: layer.id,
                 name: layer.name.clone(),
                 visible: layer.visible,
+                locked: layer.locked,
                 opacity: layer.opacity,
                 blend: layer.blend,
                 x: layer.x,
@@ -543,6 +556,7 @@ fn restore_geom(doc: &mut Document, snap: GeomSnap) {
         let mut layer = layers.swap_remove(pos);
         layer.name = meta.name;
         layer.visible = meta.visible;
+        layer.locked = meta.locked;
         layer.opacity = meta.opacity;
         layer.blend = meta.blend;
         layer.x = meta.x;
@@ -567,6 +581,10 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
         Command::SetVisibility { index, visible } => {
             let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
             Ok(layer.visible != *visible)
+        }
+        Command::SetLocked { index, locked } => {
+            let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            Ok(layer.locked != *locked)
         }
         Command::SetOpacity { index, opacity } => {
             let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
@@ -645,6 +663,24 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
     }
 }
 
+/// Refuse edits to a locked layer. Runs after [`command_changes`], so a no-op
+/// on a locked layer is still a quiet `Ok(false)`.
+fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
+    let index = match command {
+        Command::SetOpacity { index, .. }
+        | Command::MoveLayer { index, .. }
+        | Command::ScaleLayer { index, .. }
+        | Command::RotateLayer { index, .. }
+        | Command::FlipLayer { index, .. } => *index,
+        _ => return Ok(()),
+    };
+    if doc.layers.get(index).ok_or(Error::BadLayer)?.locked {
+        Err(Error::Locked)
+    } else {
+        Ok(())
+    }
+}
+
 fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
     match command {
         Command::AddLayer => {
@@ -675,6 +711,7 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             let source = doc.layers.get(index).ok_or(Error::BadLayer)?.clone();
             let mut layer = blank_layer(doc, &format!("{} copy", source.name));
             layer.visible = source.visible;
+            layer.locked = source.locked;
             layer.opacity = source.opacity;
             layer.blend = source.blend;
             layer.x = source.x + 16;
@@ -703,6 +740,9 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
         }
         Command::SetVisibility { index, visible } => {
             doc.layer_mut(index)?.visible = visible;
+        }
+        Command::SetLocked { index, locked } => {
+            doc.layer_mut(index)?.locked = locked;
         }
         Command::SetOpacity { index, opacity } => {
             doc.layer_mut(index)?.opacity = opacity.clamp(0.0, 1.0);
@@ -896,6 +936,101 @@ mod tests {
         editor.doc.layers[0].x = -1;
         editor.doc.layers[0].y = 0;
         assert_eq!(editor.document().layer_at(-0.5, 0.0), None);
+    }
+
+    #[test]
+    fn a_locked_layer_refuses_layer_edits_but_not_canvas_edits() {
+        let mut editor = doc_with(4, 4, (1, 1), rgba(255, 0, 0, 255));
+        editor
+            .apply(Command::SetLocked {
+                index: 0,
+                locked: true,
+            })
+            .unwrap();
+        let refused = [
+            Command::MoveLayer {
+                index: 0,
+                x: 1,
+                y: 0,
+            },
+            Command::SetOpacity {
+                index: 0,
+                opacity: 0.5,
+            },
+            Command::ScaleLayer {
+                index: 0,
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+                filter: ScaleFilter::Nearest,
+            },
+            Command::RotateLayer {
+                index: 0,
+                degrees_cw: 90.0,
+            },
+            Command::FlipLayer {
+                index: 0,
+                axis: Axis::Horizontal,
+            },
+        ];
+        for command in refused {
+            assert!(matches!(editor.apply(command), Err(Error::Locked)));
+        }
+        assert!(!editor
+            .apply(Command::MoveLayer {
+                index: 0,
+                x: 0,
+                y: 0,
+            })
+            .unwrap());
+        assert!(editor
+            .apply(Command::Rename {
+                index: 0,
+                name: "Base".into(),
+            })
+            .unwrap());
+        assert!(editor
+            .apply(Command::FlipCanvas {
+                axis: Axis::Horizontal,
+            })
+            .unwrap());
+        assert_eq!(editor.document().layers[0].pixels.get_pixel(2, 1)[0], 255);
+        assert!(editor.document().layers[0].locked);
+    }
+
+    #[test]
+    fn locking_is_undoable_and_duplicates_keep_it() {
+        let mut editor = doc_with(2, 2, (0, 0), rgba(255, 0, 0, 255));
+        editor
+            .apply(Command::SetLocked {
+                index: 0,
+                locked: true,
+            })
+            .unwrap();
+        editor.apply(Command::DuplicateLayer { index: 0 }).unwrap();
+        assert!(editor.document().layers[1].locked);
+        editor.undo();
+        editor.undo();
+        assert!(!editor.document().layers[0].locked);
+        editor.redo();
+        assert!(editor.document().layers[0].locked);
+    }
+
+    #[test]
+    fn layer_at_passes_through_locked_layers() {
+        let mut editor = doc_with(2, 2, (0, 0), rgba(255, 0, 0, 255));
+        editor.apply(Command::AddLayer).unwrap();
+        editor.doc.layers[1]
+            .pixels
+            .put_pixel(0, 0, rgba(0, 255, 0, 255));
+        editor
+            .apply(Command::SetLocked {
+                index: 1,
+                locked: true,
+            })
+            .unwrap();
+        assert_eq!(editor.document().layer_at(0.0, 0.0), Some(0));
     }
 
     #[test]
