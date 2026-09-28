@@ -37,22 +37,17 @@ pub fn crop(doc: &mut Document, x: i32, y: i32, width: u32, height: u32) -> Resu
         let ix1 = (lx + lw).min(x1);
         let iy1 = (ly + lh).min(y1);
         if ix1 <= ix0 || iy1 <= iy0 {
-            layer.pixels = RgbaImage::new(1, 1);
+            layer.transform(|_| RgbaImage::new(1, 1));
             layer.x = 0;
             layer.y = 0;
             continue;
         }
         let local_x = (ix0 - lx) as u32;
         let local_y = (iy0 - ly) as u32;
-        let cropped = imageops::crop_imm(
-            &layer.pixels,
-            local_x,
-            local_y,
-            (ix1 - ix0) as u32,
-            (iy1 - iy0) as u32,
-        )
-        .to_image();
-        layer.pixels = cropped;
+        let (width, height) = ((ix1 - ix0) as u32, (iy1 - iy0) as u32);
+        layer.transform(|pixels| {
+            imageops::crop_imm(pixels, local_x, local_y, width, height).to_image()
+        });
         layer.x = ix0 - x0;
         layer.y = iy0 - y0;
     }
@@ -157,7 +152,7 @@ pub fn scale_document(
         }
         let new_w = ((layer.pixels.width() as f64) * sx).round().max(1.0) as u32;
         let new_h = ((layer.pixels.height() as f64) * sy).round().max(1.0) as u32;
-        layer.pixels = imageops::resize(&layer.pixels, new_w, new_h, filter);
+        layer.transform(|pixels| imageops::resize(pixels, new_w, new_h, filter));
         layer.x = (layer.x as f64 * sx).round() as i32;
         layer.y = (layer.y as f64 * sy).round() as i32;
     }
@@ -204,7 +199,7 @@ pub fn scale_layer(
         layer.y = y;
         return Ok(());
     }
-    layer.pixels = imageops::resize(&layer.pixels, width, height, filter);
+    layer.transform(|pixels| imageops::resize(pixels, width, height, filter));
     layer.x = x;
     layer.y = y;
     Ok(())
@@ -215,25 +210,16 @@ pub fn rotate_canvas(doc: &mut Document, turn: QuarterTurn) {
     for layer in &mut doc.layers {
         layer.rasterize();
         let (x, y, w, h) = (layer.x, layer.y, layer.width(), layer.height());
-        let (pixels, nx, ny) = match turn {
-            QuarterTurn::Cw => {
-                let pixels = imageops::rotate90(&layer.pixels);
-                (pixels, height as i32 - y - h as i32, x)
-            }
-            QuarterTurn::Ccw => {
-                let pixels = imageops::rotate270(&layer.pixels);
-                (pixels, y, width as i32 - x - w as i32)
-            }
-            QuarterTurn::Half => {
-                let pixels = imageops::rotate180(&layer.pixels);
-                (
-                    pixels,
-                    width as i32 - x - w as i32,
-                    height as i32 - y - h as i32,
-                )
-            }
+        let (nx, ny) = match turn {
+            QuarterTurn::Cw => (height as i32 - y - h as i32, x),
+            QuarterTurn::Ccw => (y, width as i32 - x - w as i32),
+            QuarterTurn::Half => (width as i32 - x - w as i32, height as i32 - y - h as i32),
         };
-        layer.pixels = pixels;
+        layer.transform(|pixels| match turn {
+            QuarterTurn::Cw => imageops::rotate90(pixels),
+            QuarterTurn::Ccw => imageops::rotate270(pixels),
+            QuarterTurn::Half => imageops::rotate180(pixels),
+        });
         layer.x = nx;
         layer.y = ny;
     }
@@ -276,11 +262,11 @@ pub fn flip_canvas(doc: &mut Document, axis: Axis) {
         );
         match axis {
             Axis::Horizontal => {
-                layer.pixels = imageops::flip_horizontal(&layer.pixels);
+                layer.transform(imageops::flip_horizontal);
                 layer.x = width as i32 - x - w;
             }
             Axis::Vertical => {
-                layer.pixels = imageops::flip_vertical(&layer.pixels);
+                layer.transform(imageops::flip_vertical);
                 layer.y = height as i32 - y - h;
             }
         }
@@ -297,10 +283,10 @@ pub fn flip_canvas(doc: &mut Document, axis: Axis) {
 
 pub fn flip_layer(doc: &mut Document, index: usize, axis: Axis) -> Result<(), Error> {
     let layer = doc.layers.get_mut(index).ok_or(Error::BadLayer)?;
-    layer.pixels = match axis {
-        Axis::Horizontal => imageops::flip_horizontal(&layer.pixels),
-        Axis::Vertical => imageops::flip_vertical(&layer.pixels),
-    };
+    match axis {
+        Axis::Horizontal => layer.transform(imageops::flip_horizontal),
+        Axis::Vertical => layer.transform(imageops::flip_vertical),
+    }
     Ok(())
 }
 
@@ -309,8 +295,19 @@ pub fn rotate_layer(doc: &mut Document, index: usize, degrees_cw: f32) -> Result
     if degrees_cw.abs() % 360.0 <= 1e-3 {
         return Ok(());
     }
-    let (pixels, x, y) = rotate_bitmap(&layer.pixels, layer.x, layer.y, degrees_cw);
-    layer.pixels = pixels;
+    // Rotate the original when there is one. It is the same size as what is
+    // shown, so it lands in the same place.
+    let base = layer
+        .original
+        .take()
+        .unwrap_or_else(|| std::mem::take(&mut layer.pixels));
+    let (rotated, x, y) = rotate_bitmap(&base, layer.x, layer.y, degrees_cw);
+    if layer.adjustments.is_empty() {
+        layer.pixels = rotated;
+    } else {
+        layer.pixels = super::adjust_all(&rotated, &layer.adjustments);
+        layer.original = Some(rotated);
+    }
     layer.x = x;
     layer.y = y;
     Ok(())

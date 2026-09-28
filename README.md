@@ -57,7 +57,7 @@ The Text tool adds text where you click, or changes the text you click on. The S
 
 Layer ▸ Group gathers the selected layers into a group, which moves, hides, and fades as one. Drop a layer onto a group's row to put it inside. A group at full opacity in Normal mode lets its layers blend with what is below it; below full opacity, or in another mode, its layers are flattened together first.
 
-The Adjust menu changes the selected layer's pixels: brightness and contrast, hue and saturation, levels, grayscale, blur, and sharpen. Each dialog previews on the canvas until you apply or cancel it. Each layer has a blend mode, such as Multiply, Screen, or Overlay, picked under the opacity slider.
+The Adjust menu adjusts the selected layer: brightness and contrast, hue and saturation, levels, grayscale, blur, and sharpen. Each dialog previews on the canvas until you apply or cancel it. Adjustments aren't baked in: the layer keeps its original pixels, and right-clicking its row lists the adjustments to take off one at a time or all at once. They survive moving, resizing, rotating, and saving. Each layer has a blend mode, such as Multiply, Screen, or Overlay, picked under the opacity slider.
 
 Image ▸ Trim to Content crops the canvas to the pixels the visible layers draw, ignoring the canvas background. File ▸ Open Recent and the welcome screen list the files Pixel opened or saved recently.
 

@@ -3,6 +3,7 @@
 
 use super::canvas::upload;
 use super::model::Session;
+use super::shell::adjustment_label;
 use super::shell::Shell;
 use gtk::gdk;
 use gtk::glib;
@@ -692,6 +693,17 @@ fn layer_row(
     });
     row.add_controller(rename_click);
 
+    // Right-click opens the layer's menu, with its adjustments.
+    let menu_click = gtk::GestureClick::new();
+    menu_click.set_button(gdk::BUTTON_SECONDARY);
+    let shell_menu = shell.clone();
+    let row_for_menu = row.clone();
+    menu_click.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        shell_menu.show_layer_menu(index, row_for_menu.upcast_ref(), x, y);
+    });
+    row.add_controller(menu_click);
+
     let picture: gtk::Widget = match thumbnail {
         Some(thumbnail) => {
             let picture = gtk::Picture::for_paintable(thumbnail);
@@ -715,6 +727,17 @@ fn layer_row(
     content.append(&lock);
     content.append(&picture);
     content.append(&name_box);
+    if !layer.adjustments.is_empty() {
+        let badge = gtk::Image::from_icon_name("color-select-symbolic");
+        badge.set_valign(gtk::Align::Center);
+        badge.add_css_class("dim-label");
+        let names: Vec<String> = layer.adjustments.iter().map(adjustment_label).collect();
+        badge.set_tooltip_text(Some(&format!(
+            "Adjusted: {}. Right-click to remove.",
+            names.join(", ")
+        )));
+        content.append(&badge);
+    }
     row.set_child(Some(&content));
 
     let source = gtk::DragSource::new();

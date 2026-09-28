@@ -1,7 +1,7 @@
 //! Open images, save the layered project, and export a flattened file.
 
 use super::composite::composite;
-use super::{Background, BlendMode, Document, Error, Guides, Layer, LayerKind};
+use super::{Adjustment, Background, BlendMode, Document, Error, Guides, Layer, LayerKind};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::{ImageEncoder, ImageReader, RgbaImage};
@@ -54,12 +54,17 @@ pub fn save_project(doc: &Document, path: &Path) -> Result<(), Error> {
         .map_err(|err| Error::Write(err.to_string()))?;
 
     for (index, layer) in manifest.layers.iter().enumerate() {
-        let mut bytes = Cursor::new(Vec::new());
-        write_png_to(&doc.layers[index].pixels, doc.ppi, &mut bytes)?;
-        zip.start_file(&layer.file, png_opts)
-            .map_err(|err| Error::Write(err.to_string()))?;
-        zip.write_all(bytes.get_ref())
-            .map_err(|err| Error::Write(err.to_string()))?;
+        let source = &doc.layers[index];
+        let images = std::iter::once((&layer.file, &source.pixels))
+            .chain(layer.original.as_ref().zip(source.original.as_ref()));
+        for (name, pixels) in images {
+            let mut bytes = Cursor::new(Vec::new());
+            write_png_to(pixels, doc.ppi, &mut bytes)?;
+            zip.start_file(name, png_opts)
+                .map_err(|err| Error::Write(err.to_string()))?;
+            zip.write_all(bytes.get_ref())
+                .map_err(|err| Error::Write(err.to_string()))?;
+        }
     }
     zip.finish().map_err(|err| Error::Write(err.to_string()))?;
     Ok(())
@@ -84,19 +89,11 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
     let mut layers = Vec::with_capacity(manifest.layers.len());
     let mut next_id = 1u64;
     for layer in &manifest.layers {
-        if !is_layer_file(&layer.file) {
-            return Err(Error::BadProject);
-        }
-        let mut entry = archive
-            .by_name(&layer.file)
-            .map_err(|_| Error::BadProject)?;
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|err| Error::Decode(err.to_string()))?;
-        let pixels = image::load_from_memory(&bytes)
-            .map_err(|err| Error::Decode(err.to_string()))?
-            .into_rgba8();
+        let pixels = read_layer_png(&mut archive, &layer.file)?;
+        let original = match &layer.original {
+            Some(name) => Some(read_layer_png(&mut archive, name)?),
+            None => None,
+        };
         next_id = next_id.max(layer.id.saturating_add(1));
         layers.push(Layer {
             id: layer.id,
@@ -110,6 +107,8 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
             pixels,
             kind: layer.kind.clone(),
             parent: layer.parent,
+            adjustments: layer.adjustments.clone(),
+            original,
         });
     }
     let last = layers.len() - 1;
@@ -139,6 +138,22 @@ pub fn open_project(path: &Path) -> Result<Document, Error> {
     )
 }
 
+fn read_layer_png(archive: &mut zip::ZipArchive<File>, name: &str) -> Result<RgbaImage, Error> {
+    if !is_layer_file(name) {
+        return Err(Error::BadProject);
+    }
+    let mut entry = archive.by_name(name).map_err(|_| Error::BadProject)?;
+    let mut bytes = Vec::new();
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|err| Error::Decode(err.to_string()))?;
+    Ok(image::load_from_memory(&bytes)
+        .map_err(|err| Error::Decode(err.to_string()))?
+        .into_rgba8())
+}
+
+/// `layer-NNN.png`, or `layer-NNN-original.png` for pixels before
+/// adjustments. Anything else could reach outside the archive's own files.
 fn is_layer_file(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("layer-") else {
         return false;
@@ -146,6 +161,7 @@ fn is_layer_file(name: &str) -> bool {
     let Some(number) = rest.strip_suffix(".png") else {
         return false;
     };
+    let number = number.strip_suffix("-original").unwrap_or(number);
     !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
@@ -186,6 +202,12 @@ struct LayerSer {
     /// The id of the layer's group. Missing from projects saved before groups.
     #[serde(default)]
     parent: Option<u64>,
+    /// Missing from projects saved before adjustments could be removed.
+    #[serde(default)]
+    adjustments: Vec<Adjustment>,
+    /// The file holding the pixels before the adjustments, when kept.
+    #[serde(default)]
+    original: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +256,11 @@ impl Manifest {
                     file: format!("layer-{index:03}.png"),
                     kind: layer.kind.clone(),
                     parent: layer.parent,
+                    adjustments: layer.adjustments.clone(),
+                    original: layer
+                        .original
+                        .as_ref()
+                        .map(|_| format!("layer-{index:03}-original.png")),
                 })
                 .collect(),
         }
@@ -567,6 +594,30 @@ mod tests {
     }
 
     #[test]
+    fn project_roundtrip_keeps_adjustments_removable() {
+        let mut editor = Editor::new(sample_doc());
+        let original = editor.document().layers()[0].pixels.clone();
+        editor
+            .apply(Command::Adjust {
+                index: 0,
+                adjustment: Adjustment::Grayscale,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pixel");
+        save_project(editor.document(), &path).unwrap();
+        let mut reopened = Editor::new(open_project(&path).unwrap());
+        assert_eq!(
+            reopened.document().layers()[0].adjustments,
+            [Adjustment::Grayscale]
+        );
+        reopened
+            .apply(Command::RevertAdjustments { index: 0 })
+            .unwrap();
+        assert_eq!(reopened.document().layers()[0].pixels, original);
+    }
+
+    #[test]
     fn project_roundtrip_keeps_groups() {
         let mut editor = Editor::new(sample_doc());
         editor.apply(Command::AddLayer).unwrap();
@@ -625,5 +676,8 @@ mod tests {
         assert!(!is_layer_file("../secret.png"));
         assert!(!is_layer_file("layer-../x.png"));
         assert!(is_layer_file("layer-000.png"));
+        assert!(is_layer_file("layer-000-original.png"));
+        assert!(!is_layer_file("layer--original.png"));
+        assert!(!is_layer_file("layer-../x-original.png"));
     }
 }

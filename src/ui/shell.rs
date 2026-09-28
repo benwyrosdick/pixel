@@ -575,6 +575,25 @@ impl Shell {
                 shell.edit_text(index);
             }
         });
+        self.add_action("revert-adjustments", &[], |shell| {
+            if let Some(index) = shell.active_index() {
+                shell.edit(Command::RevertAdjustments { index });
+            }
+        });
+        let remove = gio::SimpleAction::new("remove-adjustment", Some(glib::VariantTy::UINT32));
+        let shell = self.clone();
+        remove.connect_activate(move |_, target| {
+            let (Some(index), Some(position)) =
+                (shell.active_index(), target.and_then(|t| t.get::<u32>()))
+            else {
+                return;
+            };
+            shell.edit(Command::RemoveAdjustment {
+                index,
+                position: position as usize,
+            });
+        });
+        self.window.add_action(&remove);
         self.add_action("rasterize", &[], |shell| {
             if let Some(index) = shell.active_index() {
                 shell.edit(Command::Rasterize { index });
@@ -1026,6 +1045,93 @@ impl Shell {
         }
     }
 
+    /// Open a layer's right-click menu at `(x, y)` in `row`. The layer is
+    /// selected first, unless it is already part of the selection.
+    pub fn show_layer_menu(self: &Rc<Self>, index: usize, row: &gtk::Widget, x: f64, y: f64) {
+        let root = self.layers.root.clone();
+        let Some(point) = row.compute_point(&root, &gtk::graphene::Point::new(x as f32, y as f32))
+        else {
+            return;
+        };
+        let shell = self.clone();
+        // Selecting rebuilds the rows, so finish with this click first.
+        glib::idle_add_local_once(move || {
+            let selected = shell.selected();
+            if !selected.contains(&index) {
+                shell.set_selection(vec![index]);
+            }
+            let menu = shell.layer_menu(index);
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&root);
+            popover.set_has_arrow(false);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                point.x() as i32,
+                point.y() as i32,
+                1,
+                1,
+            )));
+            popover.connect_closed(|popover| {
+                let popover = popover.clone();
+                glib::idle_add_local_once(move || popover.unparent());
+            });
+            popover.popup();
+        });
+    }
+
+    /// The right-click menu for one layer: its adjustments, then the layer
+    /// commands that apply to it.
+    fn layer_menu(&self, index: usize) -> gio::Menu {
+        let menu = gio::Menu::new();
+        let model = self.model.borrow();
+        let Some(doc) = model
+            .session
+            .as_ref()
+            .map(|session| session.editor.document())
+        else {
+            return menu;
+        };
+        let Some(layer) = doc.layers().get(index) else {
+            return menu;
+        };
+        // Adjustment commands act on the one selected layer, so they only
+        // show when this is it.
+        if doc.active_index() == Some(index) && !layer.adjustments.is_empty() {
+            let section = gio::Menu::new();
+            for (position, adjustment) in layer.adjustments.iter().enumerate() {
+                let item = gio::MenuItem::new(
+                    Some(&menu_label(&format!(
+                        "Remove {}",
+                        adjustment_label(adjustment)
+                    ))),
+                    None,
+                );
+                item.set_action_and_target_value(
+                    Some("win.remove-adjustment"),
+                    Some(&(position as u32).to_variant()),
+                );
+                section.append_item(&item);
+            }
+            section.append_item(&menu_item("Revert All Adjustments", "revert-adjustments"));
+            menu.append_section(Some("Adjustments"), &section);
+        }
+        let section = gio::Menu::new();
+        if matches!(layer.kind, LayerKind::Text { .. }) {
+            section.append_item(&menu_item("Edit Text…", "edit-text"));
+        }
+        if layer.is_vector() {
+            section.append_item(&menu_item("Rasterize", "rasterize"));
+        }
+        section.append_item(&menu_item("Duplicate", "duplicate"));
+        section.append_item(&menu_item("Delete", "delete-layer"));
+        if matches!(layer.kind, LayerKind::Group { .. }) {
+            section.append_item(&menu_item("Ungroup", "ungroup"));
+        } else {
+            section.append_item(&menu_item("Group", "group"));
+        }
+        menu.append_section(None, &section);
+        menu
+    }
+
     pub fn set_active_blend(self: &Rc<Self>, blend: BlendMode) {
         if let Some(index) = self.active_index() {
             self.edit(Command::SetBlend { index, blend });
@@ -1306,6 +1412,9 @@ impl Shell {
             let text = unlocked.is_some_and(|layer| matches!(layer.kind, LayerKind::Text { .. }));
             self.enable("edit-text", text);
             self.enable("rasterize", unlocked.is_some_and(|layer| layer.is_vector()));
+            let adjusted = unlocked.is_some_and(|layer| !layer.adjustments.is_empty());
+            self.enable("revert-adjustments", adjusted);
+            self.enable("remove-adjustment", adjusted);
             drop(model);
             self.fill_tool_options();
             let model = self.model.borrow();
@@ -1394,6 +1503,8 @@ impl Shell {
             "ungroup",
             "edit-text",
             "rasterize",
+            "revert-adjustments",
+            "remove-adjustment",
             "undo",
             "redo",
         ] {
@@ -2805,6 +2916,7 @@ fn app_menu(recent: &gio::Menu) -> gio::Menu {
         menu.append_item(&menu_item("Delete", "delete-layer"));
         menu.append_item(&menu_item("Edit Text…", "edit-text"));
         menu.append_item(&menu_item("Rasterize", "rasterize"));
+        menu.append_item(&menu_item("Revert Adjustments", "revert-adjustments"));
         menu.append_item(&menu_item("Rotate…", "rotate-layer"));
         menu.append_item(&menu_item("Flip Horizontal", "flip-layer-h"));
         menu.append_item(&menu_item("Flip Vertical", "flip-layer-v"));
@@ -2837,6 +2949,11 @@ fn app_menu(recent: &gio::Menu) -> gio::Menu {
             ]),
         );
         menu.append_section(None, &section(&["blur", "sharpen"]));
+        menu.append_section(None, &{
+            let section = gio::Menu::new();
+            section.append_item(&menu_item("Revert Adjustments", "revert-adjustments"));
+            section
+        });
         menu
     });
     menu.append_submenu(Some("Selection"), &{
@@ -2947,8 +3064,43 @@ fn texture_image(texture: &gdk::Texture) -> image::RgbaImage {
     image::RgbaImage::from_raw(width, height, pixels).expect("each row is width × 4 bytes")
 }
 
-/// Adjustment and filter actions, with their menu labels. Each rewrites the
-/// one selected layer's pixels.
+/// How an adjustment reads in menus and tooltips, with its settings.
+pub fn adjustment_label(adjustment: &Adjustment) -> String {
+    let signed = |v: f32| format!("{:+.0}", v).replace('-', "−");
+    match *adjustment {
+        Adjustment::BrightnessContrast {
+            brightness,
+            contrast,
+        } => format!(
+            "Brightness and Contrast ({}, {})",
+            signed(brightness),
+            signed(contrast)
+        ),
+        Adjustment::HueSaturation {
+            hue,
+            saturation,
+            lightness,
+        } => format!(
+            "Hue and Saturation ({}°, {}, {})",
+            signed(hue),
+            signed(saturation),
+            signed(lightness)
+        ),
+        Adjustment::Levels {
+            black,
+            white,
+            gamma,
+        } => format!("Levels ({black}–{white}, {gamma:.2})"),
+        Adjustment::Grayscale => "Grayscale".into(),
+        Adjustment::Blur { radius } => format!("Blur ({radius:.1} px)"),
+        Adjustment::Sharpen { amount, radius } => {
+            format!("Sharpen ({amount:.0}%, {radius:.1} px)")
+        }
+    }
+}
+
+/// Adjustment and filter actions, with their menu labels. Each adds to the
+/// one selected layer's list of adjustments, which can be taken off again.
 const ADJUSTMENTS: [(&str, &str); 6] = [
     ("brightness-contrast", "Brightness and Contrast…"),
     ("hue-saturation", "Hue and Saturation…"),

@@ -1,10 +1,11 @@
 //! Color adjustments and filters that rewrite a layer's pixels.
 
 use image::{ImageBuffer, Rgba, RgbaImage};
+use serde::{Deserialize, Serialize};
 
 /// A change to every pixel of a layer. Alpha is kept, except that blur and
 /// sharpen spread it along with the color.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Adjustment {
     /// Both from -100 to 100.
     BrightnessContrast {
@@ -61,6 +62,15 @@ impl Adjustment {
             Self::Sharpen { amount, radius } => amount <= 0.0 || radius <= 0.0,
         }
     }
+}
+
+/// `image` with each adjustment applied in turn.
+pub fn adjust_all(image: &RgbaImage, adjustments: &[Adjustment]) -> RgbaImage {
+    adjustments
+        .iter()
+        .fold(image.clone(), |pixels, &adjustment| {
+            adjust(&pixels, adjustment)
+        })
 }
 
 /// `image` with `adjustment` applied.

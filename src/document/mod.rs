@@ -9,7 +9,7 @@ mod io;
 mod ops;
 mod render;
 
-pub use adjust::{adjust, Adjustment};
+pub use adjust::{adjust, adjust_all, Adjustment};
 pub use composite::{composite, composite_layers, composite_with, LayerOverride};
 pub use handles::{
     clockwise_delta, hit_handle, pointer_angle, resize_rect, rotate_handle_point, rotated_bounds,
@@ -232,6 +232,12 @@ pub struct Layer {
     pub kind: LayerKind,
     /// The id of the group the layer is in, if any.
     pub parent: Option<u64>,
+    /// Adjustments and filters, in the order they were applied. `pixels`
+    /// shows them. They can be taken off again.
+    pub adjustments: Vec<Adjustment>,
+    /// A pixel layer's pixels before its adjustments, kept while it has any.
+    /// Text and shapes are redrawn instead.
+    pub original: Option<RgbaImage>,
 }
 
 /// What a layer is made of.
@@ -286,15 +292,53 @@ impl Layer {
             }
             LayerKind::Raster | LayerKind::Group { .. } => {}
         }
-        self.pixels = rendered.pixels;
+        self.pixels = adjust_all(&rendered.pixels, &self.adjustments);
         self.x = anchor.0 - rendered.origin.0;
         self.y = anchor.1 - rendered.origin.1;
     }
 
-    /// Keep the layer as it looks now, as plain pixels.
+    /// Keep the layer as it looks now, as plain pixels. Its adjustments stay
+    /// removable: the drawing under them becomes the original.
     fn rasterize(&mut self) {
-        if self.is_vector() {
-            self.kind = LayerKind::Raster;
+        if !self.is_vector() {
+            return;
+        }
+        if !self.adjustments.is_empty() {
+            self.original = match &self.kind {
+                LayerKind::Text { spec, .. } => Some(render_text(spec).pixels),
+                LayerKind::Shape { spec, .. } => Some(render_shape(spec).pixels),
+                _ => None,
+            };
+        }
+        self.kind = LayerKind::Raster;
+    }
+
+    /// Change the layer's pixels with `f`. With adjustments, `f` changes the
+    /// original instead, and the adjustments are applied again on top.
+    fn transform(&mut self, f: impl Fn(&RgbaImage) -> RgbaImage) {
+        match self.original.take() {
+            Some(original) => {
+                let original = f(&original);
+                self.pixels = adjust_all(&original, &self.adjustments);
+                self.original = Some(original);
+            }
+            None => self.pixels = f(&self.pixels),
+        }
+    }
+
+    /// Show the layer with its current list of adjustments.
+    fn reapply(&mut self) {
+        if let Some(anchor) = self.anchor() {
+            self.redraw(anchor);
+            return;
+        }
+        if let Some(original) = self.original.take() {
+            if self.adjustments.is_empty() {
+                self.pixels = original;
+            } else {
+                self.pixels = adjust_all(&original, &self.adjustments);
+                self.original = Some(original);
+            }
         }
     }
 
@@ -610,6 +654,8 @@ fn blank_layer(doc: &mut Document, name: &str) -> Layer {
         pixels: RgbaImage::new(doc.width, doc.height),
         kind: LayerKind::Raster,
         parent: None,
+        adjustments: Vec::new(),
+        original: None,
     }
 }
 
@@ -706,10 +752,19 @@ pub enum Command {
         index: usize,
         blend: BlendMode,
     },
-    /// Rewrite one layer's pixels with a color adjustment or filter.
+    /// Add a color adjustment or filter to a layer. It stays removable.
     Adjust {
         index: usize,
         adjustment: Adjustment,
+    },
+    /// Take one adjustment off a layer, by its place in the layer's list.
+    RemoveAdjustment {
+        index: usize,
+        position: usize,
+    },
+    /// Take every adjustment off a layer.
+    RevertAdjustments {
+        index: usize,
     },
     MoveLayer {
         index: usize,
@@ -798,6 +853,8 @@ impl Command {
                 | Self::FlipCanvas { .. }
                 | Self::FlipLayer { .. }
                 | Self::Adjust { .. }
+                | Self::RemoveAdjustment { .. }
+                | Self::RevertAdjustments { .. }
                 | Self::AddText { .. }
                 | Self::AddShape { .. }
                 | Self::SetText { .. }
@@ -1052,6 +1109,17 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             }
             Ok(!adjustment.is_identity())
         }
+        Command::RemoveAdjustment { index, position } => {
+            let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            if *position >= layer.adjustments.len() {
+                return Err(Error::BadLayer);
+            }
+            Ok(true)
+        }
+        Command::RevertAdjustments { index } => {
+            let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            Ok(!layer.adjustments.is_empty())
+        }
         Command::AddText { .. } | Command::AddShape { .. } => Ok(true),
         Command::SetText { index, spec } => {
             match &doc.layers.get(*index).ok_or(Error::BadLayer)?.kind {
@@ -1181,6 +1249,8 @@ fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
         Command::SetOpacity { index, .. }
         | Command::SetBlend { index, .. }
         | Command::Adjust { index, .. }
+        | Command::RemoveAdjustment { index, .. }
+        | Command::RevertAdjustments { index }
         | Command::SetText { index, .. }
         | Command::SetShape { index, .. }
         | Command::Rasterize { index }
@@ -1301,8 +1371,24 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
         Command::SetBlend { index, blend } => doc.layer_mut(index)?.blend = blend,
         Command::Adjust { index, adjustment } => {
             let layer = doc.layer_mut(index)?;
-            layer.rasterize();
+            if !layer.is_vector() && layer.original.is_none() {
+                layer.original = Some(layer.pixels.clone());
+            }
+            layer.adjustments.push(adjustment);
             layer.pixels = adjust(&layer.pixels, adjustment);
+        }
+        Command::RemoveAdjustment { index, position } => {
+            let layer = doc.layer_mut(index)?;
+            if position >= layer.adjustments.len() {
+                return Err(Error::BadLayer);
+            }
+            layer.adjustments.remove(position);
+            layer.reapply();
+        }
+        Command::RevertAdjustments { index } => {
+            let layer = doc.layer_mut(index)?;
+            layer.adjustments.clear();
+            layer.reapply();
         }
         Command::AddText { spec, x, y } => {
             let mut layer = blank_layer(doc, &text_name(&spec.text));
@@ -2071,6 +2157,126 @@ mod tests {
             _ => panic!("still text"),
         }
         assert_eq!(editor.document().layers[1].anchor(), Some((-20, 10)));
+    }
+
+    fn brighter() -> Adjustment {
+        Adjustment::BrightnessContrast {
+            brightness: 50.0,
+            contrast: 0.0,
+        }
+    }
+
+    #[test]
+    fn adjustments_come_off_one_at_a_time_or_all_at_once() {
+        let mut editor = doc_with(2, 1, (0, 0), rgba(200, 40, 40, 255));
+        let original = editor.doc.layers[0].pixels.clone();
+        for adjustment in [Adjustment::Grayscale, brighter()] {
+            editor
+                .apply(Command::Adjust {
+                    index: 0,
+                    adjustment,
+                })
+                .unwrap();
+        }
+        assert_eq!(editor.document().layers[0].adjustments.len(), 2);
+
+        editor
+            .apply(Command::RemoveAdjustment {
+                index: 0,
+                position: 0,
+            })
+            .unwrap();
+        let only_brighter = adjust(&original, brighter());
+        assert_eq!(editor.document().layers[0].pixels, only_brighter);
+
+        editor
+            .apply(Command::RevertAdjustments { index: 0 })
+            .unwrap();
+        let layer = &editor.document().layers[0];
+        assert_eq!(layer.pixels, original);
+        assert!(layer.adjustments.is_empty() && layer.original.is_none());
+        assert!(!editor
+            .apply(Command::RevertAdjustments { index: 0 })
+            .unwrap());
+    }
+
+    #[test]
+    fn a_revert_still_works_after_the_layer_is_transformed() {
+        let mut editor = doc_with(4, 2, (0, 0), rgba(200, 40, 40, 255));
+        editor
+            .apply(Command::Adjust {
+                index: 0,
+                adjustment: Adjustment::Grayscale,
+            })
+            .unwrap();
+        editor
+            .apply(Command::FlipLayer {
+                index: 0,
+                axis: Axis::Horizontal,
+            })
+            .unwrap();
+        editor
+            .apply(Command::RotateCanvas {
+                turn: QuarterTurn::Cw,
+            })
+            .unwrap();
+        let layer = &editor.document().layers[0];
+        assert_eq!(layer.pixels.dimensions(), (2, 4));
+        // The one red pixel starts at (0, 0). Flipped it is at (3, 0), and a
+        // clockwise turn of the 4×2 layer takes that to (1, 3).
+        let [r, g, _, a] = layer.pixels.get_pixel(1, 3).0;
+        assert_eq!((r, a), (g, 255), "still gray");
+        editor
+            .apply(Command::RevertAdjustments { index: 0 })
+            .unwrap();
+        assert_eq!(
+            editor.document().layers[0].pixels.get_pixel(1, 3),
+            &rgba(200, 40, 40, 255)
+        );
+    }
+
+    #[test]
+    fn text_keeps_its_adjustments_through_edits_and_rasterizing() {
+        let mut editor = doc_with(200, 100, (0, 0), rgba(0, 0, 0, 255));
+        editor
+            .apply(Command::AddText {
+                spec: TextSpec {
+                    color: [255, 0, 0, 255],
+                    ..label("Hi")
+                },
+                x: 10,
+                y: 10,
+            })
+            .unwrap();
+        editor
+            .apply(Command::Adjust {
+                index: 1,
+                adjustment: Adjustment::Grayscale,
+            })
+            .unwrap();
+        editor
+            .apply(Command::SetText {
+                index: 1,
+                spec: TextSpec {
+                    color: [255, 0, 0, 255],
+                    ..label("Hello")
+                },
+            })
+            .unwrap();
+        let gray = |editor: &Editor| {
+            editor.document().layers[1]
+                .pixels
+                .pixels()
+                .filter(|pixel| pixel[3] == 255)
+                .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+        };
+        assert!(gray(&editor), "the edit is drawn gray too");
+        editor.apply(Command::Rasterize { index: 1 }).unwrap();
+        assert!(gray(&editor));
+        editor
+            .apply(Command::RevertAdjustments { index: 1 })
+            .unwrap();
+        assert!(!gray(&editor), "red again");
     }
 
     #[test]
