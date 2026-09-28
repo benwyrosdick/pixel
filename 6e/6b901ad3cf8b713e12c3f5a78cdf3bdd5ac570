@@ -1,0 +1,24 @@
+src/ui/theme.rs
+  s_e5d054807dbd83::t_c846f1baa336dd 95
+src/ui/shell.rs
+  s_e5d054807dbd83::t_c846f1baa336dd 761-778
+src/ui/layers.rs
+  s_e5d054807dbd83::t_c846f1baa336dd 52-55,153,156-162,250-251,254-256,258,682-696,698-703,705
+  s_e5d054807dbd83::t_0700e39c06b33f 56-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6e6b901ad3cf8b713e12c3f5a78cdf3bdd5ac570",
+  "prompts": {},
+  "sessions": {
+    "s_e5d054807dbd83": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "37717b74-9e79-4f0a-8b2b-5900e74441c5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
