@@ -1571,12 +1571,30 @@ impl Shell {
                 return;
             }
             Tool::Crop => {
-                let label = hint_label(&crop_hint(session.crop));
+                let target = gtk::DropDown::from_strings(&["Canvas", "Selected layer"]);
+                target.set_selected(session.crop_layer as u32);
+                target.set_tooltip_text(Some("What the crop trims"));
+                let shell = self.clone();
+                target.connect_selected_notify(move |dropdown| {
+                    let shell = shell.clone();
+                    let layer = dropdown.selected() == 1;
+                    // Changing target rebuilds these controls, so wait.
+                    glib::idle_add_local_once(move || shell.set_crop_target(layer));
+                });
+                self.tool_options.append(&gtk::Label::new(Some("Crop")));
+                self.tool_options.append(&target);
+                let layer = crop_layer_target(session);
+                let usable = !session.crop_layer || layer.is_some();
+                let label = hint_label(&if usable {
+                    crop_hint(session.crop, session.crop_layer)
+                } else {
+                    "Select one unlocked layer to crop it.".into()
+                });
                 self.tool_options.append(&label);
                 *self.crop_label.borrow_mut() = Some(label);
                 let apply = gtk::Button::with_label("Apply crop");
                 apply.add_css_class("suggested-action");
-                apply.set_sensitive(session.crop.is_some());
+                apply.set_sensitive(session.crop.is_some() && usable);
                 let shell = self.clone();
                 apply.connect_clicked(move |_| shell.apply_crop());
                 let cancel = gtk::Button::with_label("Cancel");
@@ -2140,24 +2158,50 @@ impl Shell {
     }
 
     fn apply_crop(self: &Rc<Self>) {
-        let crop = self
-            .model
-            .borrow()
-            .session
-            .as_ref()
-            .and_then(|session| session.crop);
+        let (crop, layer) = {
+            let model = self.model.borrow();
+            let Some(session) = model.session.as_ref() else {
+                return;
+            };
+            let layer = session.crop_layer.then(|| crop_layer_target(session));
+            (session.crop, layer)
+        };
         let Some(crop) = crop else {
             return;
+        };
+        let command = match layer {
+            Some(None) => return,
+            Some(Some(index)) => Command::CropLayer {
+                index,
+                x: crop.x,
+                y: crop.y,
+                width: crop.width,
+                height: crop.height,
+            },
+            None => Command::Crop {
+                x: crop.x,
+                y: crop.y,
+                width: crop.width,
+                height: crop.height,
+            },
         };
         if let Some(session) = self.model.borrow_mut().session.as_mut() {
             session.crop = None;
         }
-        self.edit(Command::Crop {
-            x: crop.x,
-            y: crop.y,
-            width: crop.width,
-            height: crop.height,
-        });
+        self.edit(command);
+    }
+
+    /// Crop the canvas, or only the selected layer. Switching drops the box
+    /// drawn so far.
+    fn set_crop_target(self: &Rc<Self>, layer: bool) {
+        if let Some(session) = self.model.borrow_mut().session.as_mut() {
+            if session.crop_layer == layer {
+                return;
+            }
+            session.crop_layer = layer;
+            session.crop = None;
+        }
+        self.refresh();
     }
 
     fn cancel_crop(self: &Rc<Self>) {
@@ -2567,14 +2611,13 @@ impl Shell {
                         return;
                     };
                     let (bx, by) = widget_to_doc(session, x, y);
-                    let doc = session.editor.document();
-                    crop_from_points(ax, ay, bx, by, doc.width, doc.height)
+                    crop_from_points(ax, ay, bx, by, crop_limits(session))
                 };
                 if let Some(session) = self.model.borrow_mut().session.as_mut() {
                     session.crop = Some(draft);
                 }
                 if let Some(label) = self.crop_label.borrow().as_ref() {
-                    label.set_label(&crop_hint(Some(draft)));
+                    label.set_label(&crop_hint(Some(draft), false));
                 }
                 self.canvas.queue_draw();
             }
@@ -3781,19 +3824,47 @@ fn cursor_text(cursor: Option<(i32, i32)>) -> String {
     }
 }
 
-fn crop_hint(crop: Option<CropDraft>) -> String {
-    match crop {
-        Some(crop) => format!(
+fn crop_hint(crop: Option<CropDraft>, layer: bool) -> String {
+    match (crop, layer) {
+        (Some(crop), _) => format!(
             "Crop {} × {} at {}, {}",
             crop.width, crop.height, crop.x, crop.y
         ),
-        None => "Drag on the canvas to choose a crop.".into(),
+        (None, false) => "Drag on the canvas to choose a crop.".into(),
+        (None, true) => "Drag over the part of the layer to keep.".into(),
     }
 }
 
-fn crop_from_points(ax: f64, ay: f64, bx: f64, by: f64, doc_w: u32, doc_h: u32) -> CropDraft {
-    let clamp_x = |value: f64| value.clamp(0.0, doc_w as f64);
-    let clamp_y = |value: f64| value.clamp(0.0, doc_h as f64);
+/// The layer the crop tool trims in layer mode: the one selected layer, if
+/// it is unlocked and not a group.
+fn crop_layer_target(session: &super::model::Session) -> Option<usize> {
+    let doc = session.editor.document();
+    let index = doc.active_index()?;
+    let layer = &doc.layers()[index];
+    (!layer.locked && !doc.is_group(index)).then_some(index)
+}
+
+/// Where a crop drag may reach: the target layer's box in layer mode, or the
+/// canvas.
+fn crop_limits(session: &super::model::Session) -> PixelRect {
+    if session.crop_layer {
+        if let Some(index) = crop_layer_target(session) {
+            return layer_bounds(session, index);
+        }
+    }
+    let doc = session.editor.document();
+    PixelRect {
+        x: 0,
+        y: 0,
+        width: doc.width,
+        height: doc.height,
+    }
+}
+
+fn crop_from_points(ax: f64, ay: f64, bx: f64, by: f64, limits: PixelRect) -> CropDraft {
+    let (left, top) = (limits.x as f64, limits.y as f64);
+    let clamp_x = |value: f64| value.clamp(left, left + limits.width as f64);
+    let clamp_y = |value: f64| value.clamp(top, top + limits.height as f64);
     let x0 = clamp_x(ax.min(bx)).floor() as i32;
     let y0 = clamp_y(ay.min(by)).floor() as i32;
     let x1 = clamp_x(ax.max(bx)).ceil() as i32;

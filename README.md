@@ -59,6 +59,8 @@ Layer ▸ Group gathers the selected layers into a group, which moves, hides, an
 
 The Adjust menu adjusts the selected layer: brightness and contrast, hue and saturation, levels, grayscale, blur, and sharpen. Each dialog previews on the canvas until you apply or cancel it. Adjustments aren't baked in: the layer keeps its original pixels, and right-clicking its row lists the adjustments to take off one at a time or all at once. They survive moving, resizing, rotating, and saving. Each layer has a blend mode, such as Multiply, Screen, or Overlay, picked under the opacity slider.
 
+The Crop tool trims the canvas, or with Crop set to Selected layer, just that layer: drag over the part to keep, then apply.
+
 Image ▸ Trim to Content crops the canvas to the pixels the visible layers draw, ignoring the canvas background. File ▸ Open Recent and the welcome screen list the files Pixel opened or saved recently.
 
 Paste or drop an image to add it as a layer, or to open it when nothing is open. Copy takes the selected layers, flattened and trimmed to what they draw, or the whole image when nothing is selected.

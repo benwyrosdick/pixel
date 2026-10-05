@@ -244,7 +244,9 @@ mod imp {
                 snapshot.append_color(&color, &graphene::Rect::new(x + w - border, y, border, h));
             }
             snapshot.restore();
-            if session.tool != Tool::Crop {
+            // Cropping the canvas hides the selection. Cropping a layer shows
+            // which one.
+            if session.tool != Tool::Crop || session.crop_layer {
                 draw_selection(snapshot, session, model.accent);
             }
         }

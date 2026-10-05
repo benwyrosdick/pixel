@@ -801,6 +801,15 @@ pub enum Command {
         width: u32,
         height: u32,
     },
+    /// Trim one layer to where it overlaps the box. Text and shapes become
+    /// plain pixels first.
+    CropLayer {
+        index: usize,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
     ResizeCanvas {
         width: u32,
         height: u32,
@@ -854,6 +863,7 @@ impl Command {
                 | Self::FlipLayer { .. }
                 | Self::Adjust { .. }
                 | Self::RemoveAdjustment { .. }
+                | Self::CropLayer { .. }
                 | Self::RevertAdjustments { .. }
                 | Self::AddText { .. }
                 | Self::AddShape { .. }
@@ -1120,6 +1130,21 @@ fn command_changes(doc: &Document, command: &Command) -> Result<bool, Error> {
             let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
             Ok(!layer.adjustments.is_empty())
         }
+        Command::CropLayer {
+            index,
+            x,
+            y,
+            width,
+            height,
+        } => {
+            let layer = doc.layers.get(*index).ok_or(Error::BadLayer)?;
+            if doc.is_group(*index) {
+                return Err(Error::WrongKind);
+            }
+            let kept =
+                ops::layer_overlap(layer, *x, *y, *width, *height).ok_or(Error::EmptyCrop)?;
+            Ok(kept != (layer.x, layer.y, layer.width(), layer.height()))
+        }
         Command::AddText { .. } | Command::AddShape { .. } => Ok(true),
         Command::SetText { index, spec } => {
             match &doc.layers.get(*index).ok_or(Error::BadLayer)?.kind {
@@ -1250,6 +1275,7 @@ fn check_unlocked(doc: &Document, command: &Command) -> Result<(), Error> {
         | Command::SetBlend { index, .. }
         | Command::Adjust { index, .. }
         | Command::RemoveAdjustment { index, .. }
+        | Command::CropLayer { index, .. }
         | Command::RevertAdjustments { index }
         | Command::SetText { index, .. }
         | Command::SetShape { index, .. }
@@ -1389,6 +1415,17 @@ fn apply_command(doc: &mut Document, command: Command) -> Result<(), Error> {
             let layer = doc.layer_mut(index)?;
             layer.adjustments.clear();
             layer.reapply();
+        }
+        Command::CropLayer {
+            index,
+            x,
+            y,
+            width,
+            height,
+        } => {
+            let layer = doc.layer_mut(index)?;
+            layer.rasterize();
+            ops::crop_layer(layer, x, y, width, height)?;
         }
         Command::AddText { spec, x, y } => {
             let mut layer = blank_layer(doc, &text_name(&spec.text));
@@ -2277,6 +2314,63 @@ mod tests {
             .apply(Command::RevertAdjustments { index: 1 })
             .unwrap();
         assert!(!gray(&editor), "red again");
+    }
+
+    #[test]
+    fn cropping_a_layer_trims_only_it_and_keeps_its_adjustments() {
+        let mut editor = doc_with(10, 10, (0, 0), rgba(0, 0, 0, 255));
+        let mut image = RgbaImage::from_pixel(6, 4, rgba(200, 40, 40, 255));
+        image.put_pixel(5, 3, rgba(0, 0, 255, 255));
+        editor
+            .apply(Command::AddImageLayer {
+                name: "Monitor".into(),
+                image,
+            })
+            .unwrap();
+        // Centred on the 10×10 canvas, the layer covers (2, 3) to (8, 7).
+        editor
+            .apply(Command::Adjust {
+                index: 1,
+                adjustment: Adjustment::Grayscale,
+            })
+            .unwrap();
+        editor
+            .apply(Command::CropLayer {
+                index: 1,
+                x: 0,
+                y: 5,
+                width: 10,
+                height: 10,
+            })
+            .unwrap();
+        let layer = &editor.document().layers[1];
+        assert_eq!(
+            (layer.x, layer.y, layer.width(), layer.height()),
+            (2, 5, 6, 2)
+        );
+        assert_eq!(
+            editor.document().layers[0].width(),
+            10,
+            "other layers are untouched"
+        );
+        let [r, g, _, _] = layer.pixels.get_pixel(0, 0).0;
+        assert_eq!(r, g, "still gray");
+
+        editor
+            .apply(Command::RevertAdjustments { index: 1 })
+            .unwrap();
+        let layer = &editor.document().layers[1];
+        assert_eq!(layer.pixels.get_pixel(5, 1), &rgba(0, 0, 255, 255));
+        assert!(matches!(
+            editor.apply(Command::CropLayer {
+                index: 1,
+                x: 50,
+                y: 50,
+                width: 2,
+                height: 2,
+            }),
+            Err(Error::EmptyCrop)
+        ));
     }
 
     #[test]

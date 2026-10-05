@@ -104,6 +104,8 @@ pub struct Session {
     pub fit_pending: bool,
     pub space_down: bool,
     pub crop: Option<CropDraft>,
+    /// The crop tool trims the one selected layer instead of the canvas.
+    pub crop_layer: bool,
     /// The select tool's drag box, as two document-space corners.
     pub marquee: Option<(f64, f64, f64, f64)>,
     /// Lines the current drag has snapped to, drawn as smart guides.
@@ -166,6 +168,7 @@ impl Model {
             fit_pending: true,
             space_down: false,
             crop: None,
+            crop_layer: false,
             marquee: None,
             snap_lines: Vec::new(),
             guide_draft: None,

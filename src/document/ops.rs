@@ -1,10 +1,47 @@
 //! Geometry and pixel transforms. Each function mutates the document in place.
 //! Callers snapshot the document for undo before calling.
 
-use super::{Anchor, Axis, Document, Error, Guides, LayerKind, QuarterTurn};
+use super::{Anchor, Axis, Document, Error, Guides, Layer, LayerKind, QuarterTurn};
 use image::imageops::{self, FilterType};
 use image::{Rgba, RgbaImage};
 use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
+
+/// Where a layer overlaps a box, as its left, top, width, and height in the
+/// document. `None` when they don't overlap.
+pub(super) fn layer_overlap(
+    layer: &Layer,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Option<(i32, i32, u32, u32)> {
+    let x0 = x.max(layer.x);
+    let y0 = y.max(layer.y);
+    let x1 = x
+        .saturating_add(width as i32)
+        .min(layer.x + layer.width() as i32);
+    let y1 = y
+        .saturating_add(height as i32)
+        .min(layer.y + layer.height() as i32);
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
+/// Trim a layer to where it overlaps the box. Adjustments are kept, applied
+/// again to the trimmed original.
+pub(super) fn crop_layer(
+    layer: &mut Layer,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), Error> {
+    let (x0, y0, w, h) = layer_overlap(layer, x, y, width, height).ok_or(Error::EmptyCrop)?;
+    let (local_x, local_y) = ((x0 - layer.x) as u32, (y0 - layer.y) as u32);
+    layer.transform(|pixels| imageops::crop_imm(pixels, local_x, local_y, w, h).to_image());
+    layer.x = x0;
+    layer.y = y0;
+    Ok(())
+}
 
 pub fn crop(doc: &mut Document, x: i32, y: i32, width: u32, height: u32) -> Result<(), Error> {
     if width == 0 || height == 0 {
