@@ -1,0 +1,34 @@
+README.md
+  s_e5d054807dbd83::t_6abbb4b813bffd 62-63
+src/ui/canvas.rs
+  s_e5d054807dbd83::t_6abbb4b813bffd 247-249
+src/document/mod.rs
+  s_e5d054807dbd83::t_eccede6f14a9ae 1144-1145,2347-2355
+  s_e5d054807dbd83::t_c404543293bae1 804-812,866,1133-1143,1146-1147,1278,1419-1429,2319-2346,2356-2373
+  s_e5d054807dbd83::t_783244a9ad4952 2374-2375
+src/document/ops.rs
+  s_e5d054807dbd83::t_eccede6f14a9ae 20-25
+  s_e5d054807dbd83::t_c404543293bae1 4,9-19,26-44
+  s_e5d054807dbd83::t_a01f2b4469fa38 45
+src/ui/model.rs
+  s_e5d054807dbd83::t_ac54f5003b870e 107-108,171
+src/ui/shell.rs
+  s_e5d054807dbd83::t_ac54f5003b870e 1574-1592,1597,2161-2168,2172-2187,2191-2204,2614,3827-3829,3833-3860,3864-3867
+  s_e5d054807dbd83::t_eccede6f14a9ae 2620
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "85606d8cdc101bf89a2e76e75dd3694f20dfec7e",
+  "prompts": {},
+  "sessions": {
+    "s_e5d054807dbd83": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "37717b74-9e79-4f0a-8b2b-5900e74441c5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
